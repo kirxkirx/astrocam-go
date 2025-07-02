@@ -866,10 +866,26 @@ func (ac *AstroCam) run() {
 	}
 }
 
+// Version is set by build flags during release builds
+var version string
+
 func main() {
-	// Parse command line flags
+	// Define all flags consistently using flag package
 	testMode := flag.Bool("test", false, "Run in test mode (exit on errors, timeout after 2 minutes)")
+	showVersion := flag.Bool("version", false, "Show version information")
+	
+	// Parse all flags
 	flag.Parse()
+	
+	// Handle version flag after parsing
+	if *showVersion {
+		if version != "" {
+			fmt.Printf("AstroCam-GO %s\n", version)
+		} else {
+			fmt.Println("AstroCam-GO (development build)")
+		}
+		return
+	}
 
 	app, err := NewAstroCam(*testMode)
 	if err != nil {
