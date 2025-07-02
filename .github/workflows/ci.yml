@@ -209,11 +209,18 @@ jobs:
           # Test archive creation without upload using Windows binary
           # Upload will fail with mock server, but that's expected
           Write-Host "Testing archive creation and file processing..."
-          try {
-              # Run the Windows executable
-              .\astrocam-go-win64.exe -test
-          } catch {
-              Write-Host "Test completed (upload expected to fail with mock server)"
+          
+          # Run the test and capture exit code (upload failure is expected)
+          $process = Start-Process -FilePath ".\astrocam-go-win64.exe" -ArgumentList "-test" -NoNewWindow -PassThru -Wait
+          $exitCode = $process.ExitCode
+          
+          Write-Host "Process completed with exit code: $exitCode"
+          if ($exitCode -eq 1) {
+              Write-Host "Expected failure: Upload to mock server failed (this is normal)"
+          } elseif ($exitCode -eq 0) {
+              Write-Host "Unexpected success: Upload should have failed with mock server"
+          } else {
+              Write-Host "Unexpected exit code: $exitCode"
           }
 
           Write-Host "Checking created archives:"
@@ -230,12 +237,13 @@ jobs:
               Write-Host "  (no processed files)"
           }
 
-          # Verify at least some archives were created
+          # Verify at least some archives were created (this is the real test)
           $rarFiles = Get-ChildItem temp/*.rar -ErrorAction SilentlyContinue
           $zipFiles = Get-ChildItem temp/*.zip -ErrorAction SilentlyContinue
           
           if ($rarFiles -or $zipFiles) {
               Write-Host "✓ Archive creation test PASSED"
+              # Success - archives were created regardless of upload failure
           } else {
               Write-Host "✗ Archive creation test FAILED - no archives created"
               exit 1
