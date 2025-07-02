@@ -1,6 +1,16 @@
 # AstroCam Go - NMW Image Upload System
 
-A complete rewrite of the original Python astrocam system in Go, with improved reliability, built-in archive formats, and automated testing support.
+This program looks when three files with the predefined naming pattern
+appear in the input directory, packs the three files in a ZIP or RAR archive
+and sends them via HTTP POST to a server for further processing.
+
+This code is used in the [New Milky Way survey](https://scan.sai.msu.ru/nmw/), 
+it runs on the image acquisition computer and transfers images to the
+analysis computer that runs [unmw wrapper scripts](https://github.com/kirxkirx/unmw/)
+around [VaST](https://github.com/kirxkirx/vast/) to run the image analysis
+that ultimately results in an HTML page with candidate transients.
+
+It's a complete rewrite of the original Python astrocam code in Go, with improved reliability, built-in archive formats, and automated testing support.
 
 ## Key Features
 
