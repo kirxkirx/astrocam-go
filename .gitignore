@@ -1,0 +1,56 @@
+# Compiled binaries
+astrocam
+astrocam.exe
+astrocam-win64.exe
+astrocam-win32.exe
+*.exe
+
+# Configuration files with sensitive data
+config.env
+config-production.env
+config-*.env
+
+# Temporary and data directories
+temp/
+test_data/1_semka/
+test_data/2_otpravleno/
+data/
+processed/
+
+# Archive files
+*.rar
+*.zip
+
+# Go build artifacts
+go.sum
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Log files
+*.log
+
+# Backup files
+*.bak
+*.backup
+
+# Test coverage
+coverage.out
+coverage.html
+
+# Local test configurations (allowed)
+config-test.env.example
+config-ci.env.example
