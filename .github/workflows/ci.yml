@@ -1,4 +1,9 @@
-name: AstroCam CI
+In your .github/workflows/ci.yml file, change this line:
+
+yaml
+
+# Change this:
+uses: actions/upload-artifact@v4name: AstroCam CI
 
 on:
   push:
