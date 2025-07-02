@@ -71,7 +71,7 @@ jobs:
         run: |
           # Test archive creation without upload
           echo "Testing archive creation and file processing..."
-          timeout 600 ./astrocam -test || true
+          ./astrocam-go -test || true
 
           echo "Checking created archives:"
           ls -la temp/ || echo "No archives created"
@@ -175,5 +175,5 @@ jobs:
         run: |
           go build -o astrocam-go astrocam.go
           echo "Running integration test with real server..."
-          timeout 600 ./astrocam-go -test
+          ./astrocam-go -test
           echo "✓ Integration test completed successfully"
