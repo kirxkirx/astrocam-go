@@ -9,6 +9,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # This job tests Linux functionality and cross-compiles Windows binaries
+    # It does NOT execute Windows binaries - that's done in test-windows job
 
     steps:
       - name: Checkout code
@@ -60,16 +62,18 @@ jobs:
           go build -o astrocam-go astrocam.go
           echo "Linux build successful"
 
-      - name: Build Windows versions
+      - name: Build Windows versions (cross-compilation)
         run: |
+          # Cross-compile Windows binaries from Linux (not executed here)
+          # Actual Windows testing happens in the test-windows job
           GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o astrocam-go-win64.exe astrocam.go
           GOOS=windows GOARCH=386 go build -ldflags="-s -w" -o astrocam-go-win32.exe astrocam.go
           echo "Windows builds successful"
           ls -lh astrocam*
 
-      - name: Test archive creation (dry-run mode)
+      - name: Test archive creation (Linux binary)
         run: |
-          # Test archive creation without upload
+          # Test archive creation without upload using Linux binary
           echo "Testing archive creation and file processing..."
           ./astrocam-go -test || true
 
@@ -87,7 +91,7 @@ jobs:
             exit 1
           fi
 
-      - name: Test archive integrity
+      - name: Test archive integrity (Linux)
         run: |
           echo "Testing archive integrity..."
 
@@ -109,20 +113,187 @@ jobs:
             fi
           done
 
-      - name: Upload test artifacts
+      - name: Upload Linux test artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-results
+          name: linux-test-results
           path: |
             temp/
             test_data/
             *.log
           retention-days: 7
 
-  integration-test:
+  test-windows:
+    runs-on: windows-latest
+    # This job runs natively on Windows to test Windows-specific functionality
+    # Unlike the Linux job which cross-compiles Windows binaries, this actually
+    # executes the Windows binary in a real Windows environment
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Verify Go installation
+        run: go version
+
+      - name: Create test configuration
+        shell: pwsh
+        run: |
+          # Create test config with mock server (will fail upload, but tests archive creation)
+          @"
+          SAI_SERVER=http://localhost:9999/mock-upload
+          SAI_USERNAME=test_user
+          SAI_PASSWORD=test_pass
+          SAI_CAMERA_DIRECTORY=test_data/1_semka
+          SAI_PROCESSED_DIRECTORY=test_data/2_otpravleno
+          SAI_INTERVAL=10
+          SAI_COUNT=3
+          SAI_PREFIX=CI_WIN_
+          SAI_POSTFIX=_TEST
+          "@ | Out-File -FilePath "config.env" -Encoding ascii
+
+      - name: Prepare test data
+        shell: pwsh
+        run: |
+          # Create test directory structure
+          New-Item -ItemType Directory -Force test_data/1_semka
+          New-Item -ItemType Directory -Force test_data/2_otpravleno  
+          New-Item -ItemType Directory -Force temp
+
+          # Create mock FITS files for testing
+          $areas = @("064", "091", "092")
+          foreach ($area in $areas) {
+              for ($i = 1; $i -le 3; $i++) {
+                  $timestamp = (Get-Date).AddSeconds($i).ToString("yyyy-MM-dd_HH-mm-ss")
+                  $filename = "${area}_${timestamp}_test_STL-11000M.fts"
+                  # Create files with some content to test archiving
+                  $content = "Mock FITS data for testing area $area file $i " * 100
+                  Set-Content -Path "test_data/1_semka/$filename" -Value $content
+              }
+          }
+
+          Write-Host "Created test files:"
+          Get-ChildItem test_data/1_semka/
+
+      - name: Check for WinRAR/RAR availability
+        shell: pwsh
+        run: |
+          Write-Host "Checking for RAR command availability..."
+          try {
+              $rarPath = Get-Command rar -ErrorAction Stop
+              Write-Host "✓ RAR command found at: $($rarPath.Source)"
+              Write-Host "RAR version:"
+              rar
+          } catch {
+              Write-Host "⚠ RAR command not found - will use ZIP format"
+              Write-Host "Note: WinRAR can be installed to enable RAR format testing"
+          }
+
+      - name: Build Windows version
+        shell: pwsh
+        run: |
+          # When running on Windows, go build naturally produces a Windows .exe
+          go build -ldflags="-s -w" -o astrocam-go-win64.exe astrocam.go
+          Write-Host "Windows build successful"
+          Get-ChildItem astrocam-go-win64.exe
+
+      - name: Test archive creation (Windows binary)
+        shell: pwsh
+        run: |
+          # Test archive creation without upload using Windows binary
+          # Upload will fail with mock server, but that's expected
+          Write-Host "Testing archive creation and file processing..."
+          try {
+              # Run the Windows executable
+              .\astrocam-go-win64.exe -test
+          } catch {
+              Write-Host "Test completed (upload expected to fail with mock server)"
+          }
+
+          Write-Host "Checking created archives:"
+          if (Test-Path temp) {
+              Get-ChildItem temp/ -ErrorAction SilentlyContinue
+          } else {
+              Write-Host "  (no temp directory)"
+          }
+
+          Write-Host "Checking processed files:"
+          if (Test-Path test_data/2_otpravleno) {
+              Get-ChildItem test_data/2_otpravleno/ -ErrorAction SilentlyContinue
+          } else {
+              Write-Host "  (no processed files)"
+          }
+
+          # Verify at least some archives were created
+          $rarFiles = Get-ChildItem temp/*.rar -ErrorAction SilentlyContinue
+          $zipFiles = Get-ChildItem temp/*.zip -ErrorAction SilentlyContinue
+          
+          if ($rarFiles -or $zipFiles) {
+              Write-Host "✓ Archive creation test PASSED"
+          } else {
+              Write-Host "✗ Archive creation test FAILED - no archives created"
+              exit 1
+          }
+
+      - name: Test archive integrity (Windows)
+        shell: pwsh
+        run: |
+          Write-Host "Testing archive integrity..."
+
+          # Test RAR archives if they exist and rar command is available
+          $rarFiles = Get-ChildItem temp/*.rar -ErrorAction SilentlyContinue
+          if ($rarFiles) {
+              try {
+                  Get-Command rar -ErrorAction Stop | Out-Null
+                  foreach ($rarFile in $rarFiles) {
+                      Write-Host "Testing RAR archive: $($rarFile.Name)"
+                      rar t $rarFile.FullName
+                      Write-Host "✓ RAR archive integrity test passed"
+                  }
+              } catch {
+                  Write-Host "⚠ RAR command not available for integrity testing"
+              }
+          }
+
+          # Test ZIP archives if they exist
+          $zipFiles = Get-ChildItem temp/*.zip -ErrorAction SilentlyContinue
+          if ($zipFiles) {
+              foreach ($zipFile in $zipFiles) {
+                  Write-Host "Testing ZIP archive: $($zipFile.Name)"
+                  # Use PowerShell to test ZIP integrity
+                  try {
+                      Add-Type -AssemblyName System.IO.Compression.FileSystem
+                      $archive = [System.IO.Compression.ZipFile]::OpenRead($zipFile.FullName)
+                      $entryCount = $archive.Entries.Count
+                      $archive.Dispose()
+                      Write-Host "✓ ZIP archive integrity test passed ($entryCount entries)"
+                  } catch {
+                      Write-Host "✗ ZIP archive integrity test failed: $_"
+                      exit 1
+                  }
+              }
+          }
+
+      - name: Upload Windows test artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-test-results
+          path: |
+            temp/
+            test_data/
+            *.log
+          retention-days: 7
+
+  integration-test-linux:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, test-windows]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
@@ -149,12 +320,12 @@ jobs:
           SAI_PROCESSED_DIRECTORY=test_data/2_otpravleno
           SAI_INTERVAL=10
           SAI_COUNT=3
-          SAI_PREFIX=CI_
+          SAI_PREFIX=CI_LINUX_
           SAI_POSTFIX=_TEST
           EOF
-            echo "✓ Real server configuration created"
+            echo "✓ Real server configuration created for Linux integration test"
           else
-            echo "⚠ No test server configured - skipping integration test"
+            echo "⚠ No test server configured - skipping Linux integration test"
             exit 0
           fi
 
@@ -171,9 +342,78 @@ jobs:
             done
           done
 
-      - name: Build and run integration test
+      - name: Build and run Linux integration test
         run: |
           go build -o astrocam-go astrocam.go
-          echo "Running integration test with real server..."
+          echo "Running Linux integration test with real server..."
           ./astrocam-go -test
-          echo "✓ Integration test completed successfully"
+          echo "✓ Linux integration test completed successfully"
+
+  integration-test-windows:
+    runs-on: windows-latest
+    needs: [test, test-windows]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Create real test configuration
+        shell: pwsh
+        env:
+          TEST_SERVER_URL: ${{ secrets.TEST_SERVER_URL }}
+          TEST_USERNAME: ${{ secrets.TEST_USERNAME }}
+          TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
+        run: |
+          if ($env:TEST_SERVER_URL) {
+            @"
+          SAI_SERVER=$env:TEST_SERVER_URL
+          SAI_USERNAME=$env:TEST_USERNAME
+          SAI_PASSWORD=$env:TEST_PASSWORD
+          SAI_CAMERA_DIRECTORY=test_data/1_semka
+          SAI_PROCESSED_DIRECTORY=test_data/2_otpravleno
+          SAI_INTERVAL=10
+          SAI_COUNT=3
+          SAI_PREFIX=CI_WIN_
+          SAI_POSTFIX=_TEST
+          "@ | Out-File -FilePath "config.env" -Encoding ascii
+            Write-Host "✓ Real server configuration created for Windows integration test"
+          } else {
+            Write-Host "⚠ No test server configured - skipping Windows integration test"
+            exit 0
+          }
+
+      - name: Prepare integration test data
+        shell: pwsh
+        run: |
+          # Create test directory structure
+          New-Item -ItemType Directory -Force test_data/1_semka
+          New-Item -ItemType Directory -Force test_data/2_otpravleno
+          New-Item -ItemType Directory -Force temp
+
+          # Create smaller test files for real upload
+          $area = "064"  # Just one area for integration test
+          for ($i = 1; $i -le 3; $i++) {
+              $timestamp = (Get-Date).AddSeconds($i).ToString("yyyy-MM-dd_HH-mm-ss")
+              $filename = "${area}_${timestamp}_test_STL-11000M.fts"
+              # Create small files with random content for upload
+              $content = "Integration test data for area $area file $i " * 50
+              Set-Content -Path "test_data/1_semka/$filename" -Value $content
+          }
+
+          Write-Host "Created integration test files:"
+          Get-ChildItem test_data/1_semka/
+
+      - name: Build and run Windows integration test
+        shell: pwsh
+        run: |
+          # Build Windows binary natively
+          go build -ldflags="-s -w" -o astrocam-go-win64.exe astrocam.go
+          Write-Host "Running Windows integration test with real server..."
+          .\astrocam-go-win64.exe -test
+          Write-Host "✓ Windows integration test completed successfully"
