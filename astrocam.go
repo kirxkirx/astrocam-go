@@ -57,26 +57,6 @@ type FileGroup struct {
 	FilesToDelete  []string
 }
 
-// ... existing imports and type definitions stay the same ...
-
-type AstroCam struct {
-	config         *Config
-	areas          []string
-	tempDirectory  string
-	currentDir     string
-	lastUploadTime time.Time
-	useRAR         bool   
-	archiveExt     string 
-	testMode       bool   
-	testStartTime  time.Time
-}
-
-type FileGroup struct {
-	FilesToArchive []string
-	FilesToDelete  []string
-}
-
-// ADD THIS NEW FUNCTION HERE:
 // findConfigFile looks for a config file in multiple locations:
 // 1. Next to the executable (preferred)
 // 2. Current working directory (fallback)
@@ -99,7 +79,6 @@ func findConfigFile(filename string) (string, error) {
 	return "", fmt.Errorf("config file %s not found in executable directory or current directory", filename)
 }
 
-// REPLACE THE EXISTING loadConfig() FUNCTION WITH THIS:
 func loadConfig() *Config {
 	config := &Config{
 		Interval: 180, // default
@@ -122,7 +101,6 @@ func loadConfig() *Config {
 
 	log.Printf("Using config file: %s", configPath)
 
-	// Rest of the logic stays exactly the same
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -165,7 +143,6 @@ func loadConfig() *Config {
 	return config
 }
 
-// REPLACE THE EXISTING loadAreas() FUNCTION WITH THIS:
 func loadAreas() ([]string, error) {
 	// Look for areas.txt in executable directory first, then current directory
 	areasPath, err := findConfigFile("areas.txt")
@@ -181,7 +158,6 @@ func loadAreas() ([]string, error) {
 
 	log.Printf("Using areas file: %s", areasPath)
 
-	// Rest of the logic stays exactly the same
 	var areas []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -192,7 +168,6 @@ func loadAreas() ([]string, error) {
 	}
 	return areas, scanner.Err()
 }
-
 
 // checkRARAvailability checks if rar command is available
 func checkRARAvailability() bool {

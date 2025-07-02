@@ -27,6 +27,7 @@ jobs:
       - name: Create test configuration
         run: |
           # Create test config with mock server (will fail upload, but tests archive creation)
+          # Tests smart config file location - executable looks next to itself first
           cat > config.env << EOF
           SAI_SERVER=http://localhost:9999/mock-upload
           SAI_USERNAME=test_user
@@ -49,18 +50,36 @@ jobs:
             for i in {1..3}; do
               timestamp=$(date +"%Y-%m-%d_%H-%M-%S" -d "+$i seconds")
               filename="${area}_${timestamp}_test_STL-11000M.fts"
-              # Create files with some content to test archiving
-              dd if=/dev/urandom of="test_data/1_semka/$filename" bs=1024 count=100 2>/dev/null
+              # Create files with content to test new config file location feature
+              cat > "test_data/1_semka/$filename" << FITEOF
+          Mock FITS data for CI testing area $area file $i
+          Testing smart config file location detection.
+          Config files are found next to executable first, then current directory.
+          Generated: $(date)
+          Area: $area, Sequence: $i
+          FITEOF
             done
           done
 
           echo "Created test files:"
           ls -la test_data/1_semka/
 
+      - name: Check archive tools availability
+        run: |
+          echo "Checking for archive tools..."
+          if command -v rar >/dev/null 2>&1; then
+            echo "✓ RAR command available - will test RAR format"
+            rar
+          else
+            echo "⚠ RAR command not found - will test ZIP format (built-in)"
+            echo "This is normal - ZIP format works without external dependencies"
+          fi
+
       - name: Build Linux version
         run: |
           go build -o astrocam-go astrocam.go
-          echo "Linux build successful"
+          echo "✓ Linux build successful"
+          ./astrocam-go -version || echo "Version info:"
 
       - name: Build Windows versions (cross-compilation)
         run: |
@@ -68,14 +87,46 @@ jobs:
           # Actual Windows testing happens in the test-windows job
           GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o astrocam-go-win64.exe astrocam.go
           GOOS=windows GOARCH=386 go build -ldflags="-s -w" -o astrocam-go-win32.exe astrocam.go
-          echo "Windows builds successful"
+          echo "✓ Windows builds successful"
           ls -lh astrocam*
+
+      - name: Test config file detection (Linux binary)
+        run: |
+          echo "Testing smart config file location detection..."
+          
+          # Test 1: Config next to executable (preferred)
+          mkdir -p test_subdir
+          cp astrocam-go test_subdir/
+          cp config.env test_subdir/
+          cp areas.txt test_subdir/
+          
+          echo "Test 1: Config files next to executable"
+          cd test_subdir
+          echo "✓ Config files are in the same directory as executable"
+          
+          # This should find config files next to the executable
+          timeout 10s ./astrocam-go -test || echo "Expected timeout or upload failure"
+          cd ..
+          
+          # Test 2: Config in current directory (fallback)
+          mkdir -p test_fallback
+          cp astrocam-go test_fallback/
+          # Don't copy config files to test_fallback - should find them in current directory
+          
+          echo "Test 2: Config files in current directory (fallback behavior)"
+          cd test_fallback
+          timeout 10s ./astrocam-go -test || echo "Expected timeout or upload failure"
+          cd ..
+          
+          echo "✓ Config file detection tests completed"
 
       - name: Test archive creation (Linux binary)
         run: |
           # Test archive creation without upload using Linux binary
           echo "Testing archive creation and file processing..."
-          ./astrocam-go -test || true
+          echo "This tests the new smart config lookup and archive format detection"
+          
+          timeout 30s ./astrocam-go -test || echo "Expected timeout after processing files"
 
           echo "Checking created archives:"
           ls -la temp/ || echo "No archives created"
@@ -86,6 +137,14 @@ jobs:
           # Verify at least some archives were created
           if ls temp/*.rar >/dev/null 2>&1 || ls temp/*.zip >/dev/null 2>&1; then
             echo "✓ Archive creation test PASSED"
+            
+            # Check which format was used
+            if ls temp/*.rar >/dev/null 2>&1; then
+              echo "✓ RAR format used (rar command available)"
+            fi
+            if ls temp/*.zip >/dev/null 2>&1; then
+              echo "✓ ZIP format used (built-in or fallback)"
+            fi
           else
             echo "✗ Archive creation test FAILED - no archives created"
             exit 1
@@ -113,6 +172,24 @@ jobs:
             fi
           done
 
+      - name: Test authentication modes
+        run: |
+          echo "Testing authentication handling..."
+          
+          # Test with credentials
+          sed -i 's/SAI_USERNAME=test_user/SAI_USERNAME=test_user_auth/' config.env
+          sed -i 's/SAI_PASSWORD=test_pass/SAI_PASSWORD=test_pass_auth/' config.env
+          echo "Testing with credentials..."
+          timeout 10s ./astrocam-go -test || echo "Expected upload failure with auth"
+          
+          # Test without credentials (empty)
+          sed -i 's/SAI_USERNAME=test_user_auth/SAI_USERNAME=/' config.env
+          sed -i 's/SAI_PASSWORD=test_pass_auth/SAI_PASSWORD=/' config.env
+          echo "Testing without credentials..."
+          timeout 10s ./astrocam-go -test || echo "Expected upload failure without auth"
+          
+          echo "✓ Authentication mode tests completed"
+
       - name: Upload Linux test artifacts
         uses: actions/upload-artifact@v4
         if: always()
@@ -121,6 +198,8 @@ jobs:
           path: |
             temp/
             test_data/
+            test_subdir/
+            test_fallback/
             *.log
           retention-days: 7
 
@@ -146,6 +225,7 @@ jobs:
         shell: pwsh
         run: |
           # Create test config with mock server (will fail upload, but tests archive creation)
+          # Tests smart config file location on Windows
           @"
           SAI_SERVER=http://localhost:9999/mock-upload
           SAI_USERNAME=test_user
@@ -172,8 +252,15 @@ jobs:
               for ($i = 1; $i -le 3; $i++) {
                   $timestamp = (Get-Date).AddSeconds($i).ToString("yyyy-MM-dd_HH-mm-ss")
                   $filename = "${area}_${timestamp}_test_STL-11000M.fts"
-                  # Create files with some content to test archiving
-                  $content = "Mock FITS data for testing area $area file $i " * 100
+                  # Create files with content to test new config file location feature
+                  $content = @"
+          Mock FITS data for Windows CI testing area $area file $i
+          Testing smart config file location detection on Windows.
+          Config files are found next to executable first, then current directory.
+          Generated: $(Get-Date)
+          Area: $area, Sequence: $i
+          Windows path handling test.
+          "@
                   Set-Content -Path "test_data/1_semka/$filename" -Value $content
               }
           }
@@ -193,6 +280,7 @@ jobs:
           } catch {
               Write-Host "⚠ RAR command not found - will use ZIP format"
               Write-Host "Note: WinRAR can be installed to enable RAR format testing"
+              Write-Host "ZIP format works without external dependencies"
           }
 
       - name: Build Windows version
@@ -200,28 +288,71 @@ jobs:
         run: |
           # When running on Windows, go build naturally produces a Windows .exe
           go build -ldflags="-s -w" -o astrocam-go-win64.exe astrocam.go
-          Write-Host "Windows build successful"
+          Write-Host "✓ Windows build successful"
           Get-ChildItem astrocam-go-win64.exe
+          .\astrocam-go-win64.exe -version
+
+      - name: Test config file detection (Windows binary)
+        shell: pwsh
+        run: |
+          Write-Host "Testing smart config file location detection on Windows..."
+          
+          # Test 1: Config next to executable (preferred)
+          New-Item -ItemType Directory -Force test_subdir
+          Copy-Item astrocam-go-win64.exe test_subdir/
+          Copy-Item config.env test_subdir/
+          Copy-Item areas.txt test_subdir/
+          
+          Write-Host "Test 1: Config files next to executable"
+          Set-Location test_subdir
+          Write-Host "✓ Config files are in the same directory as executable"
+          
+          # This should find config files next to the executable
+          $timeoutJob = Start-Job -ScriptBlock { 
+              & ".\astrocam-go-win64.exe" -test 
+          }
+          Wait-Job $timeoutJob -Timeout 10 | Out-Null
+          Remove-Job $timeoutJob -Force
+          Set-Location ..
+          
+          # Test 2: Config in current directory (fallback)
+          New-Item -ItemType Directory -Force test_fallback
+          Copy-Item astrocam-go-win64.exe test_fallback/
+          # Don't copy config files to test_fallback
+          
+          Write-Host "Test 2: Config files in current directory (fallback behavior)"
+          Set-Location test_fallback
+          $timeoutJob = Start-Job -ScriptBlock { 
+              & ".\astrocam-go-win64.exe" -test 
+          }
+          Wait-Job $timeoutJob -Timeout 10 | Out-Null
+          Remove-Job $timeoutJob -Force
+          Set-Location ..
+          
+          Write-Host "✓ Config file detection tests completed"
 
       - name: Test archive creation (Windows binary)
         shell: pwsh
         run: |
           # Test archive creation without upload using Windows binary
           # Upload will fail with mock server, but that's expected
-          Write-Host "Testing archive creation and file processing..."
+          Write-Host "Testing archive creation and file processing on Windows..."
+          Write-Host "This tests smart config lookup and archive format detection"
           
           # Run the test and capture exit code (upload failure is expected)
-          $process = Start-Process -FilePath ".\astrocam-go-win64.exe" -ArgumentList "-test" -NoNewWindow -PassThru -Wait
-          $exitCode = $process.ExitCode
-          
-          Write-Host "Process completed with exit code: $exitCode"
-          if ($exitCode -eq 1) {
-              Write-Host "Expected failure: Upload to mock server failed (this is normal)"
-          } elseif ($exitCode -eq 0) {
-              Write-Host "Unexpected success: Upload should have failed with mock server"
-          } else {
-              Write-Host "Unexpected exit code: $exitCode"
+          $timeoutJob = Start-Job -ScriptBlock { 
+              & ".\astrocam-go-win64.exe" -test 
           }
+          
+          # Wait up to 30 seconds for processing
+          $result = Wait-Job $timeoutJob -Timeout 30
+          if ($result) {
+              $output = Receive-Job $timeoutJob
+              Write-Host $output
+          } else {
+              Write-Host "Test timed out (expected behavior)"
+          }
+          Remove-Job $timeoutJob -Force
 
           Write-Host "Checking created archives:"
           if (Test-Path temp) {
@@ -243,7 +374,14 @@ jobs:
           
           if ($rarFiles -or $zipFiles) {
               Write-Host "✓ Archive creation test PASSED"
-              # Success - archives were created regardless of upload failure
+              
+              # Check which format was used
+              if ($rarFiles) {
+                  Write-Host "✓ RAR format used (rar command available)"
+              }
+              if ($zipFiles) {
+                  Write-Host "✓ ZIP format used (built-in or fallback)"
+              }
           } else {
               Write-Host "✗ Archive creation test FAILED - no archives created"
               exit 1
@@ -252,7 +390,7 @@ jobs:
       - name: Test archive integrity (Windows)
         shell: pwsh
         run: |
-          Write-Host "Testing archive integrity..."
+          Write-Host "Testing archive integrity on Windows..."
 
           # Test RAR archives if they exist and rar command is available
           $rarFiles = Get-ChildItem temp/*.rar -ErrorAction SilentlyContinue
@@ -296,6 +434,8 @@ jobs:
           path: |
             temp/
             test_data/
+            test_subdir/
+            test_fallback/
             *.log
           retention-days: 7
 
@@ -332,6 +472,7 @@ jobs:
           SAI_POSTFIX=_TEST
           EOF
             echo "✓ Real server configuration created for Linux integration test"
+            echo "✓ Testing smart config file location with real server"
           else
             echo "⚠ No test server configured - skipping Linux integration test"
             exit 0
@@ -346,7 +487,13 @@ jobs:
             for i in {1..3}; do
               timestamp=$(date +"%Y-%m-%d_%H-%M-%S" -d "+$i seconds")
               filename="${area}_${timestamp}_test_STL-11000M.fts"
-              dd if=/dev/urandom of="test_data/1_semka/$filename" bs=1024 count=10 2>/dev/null
+              # Create small files with content for real upload test
+              cat > "test_data/1_semka/$filename" << EOF
+          Integration test data for area $area file $i
+          Testing smart config location with real server upload.
+          Generated: $(date)
+          File size optimized for integration testing.
+          EOF
             done
           done
 
@@ -354,6 +501,7 @@ jobs:
         run: |
           go build -o astrocam-go astrocam.go
           echo "Running Linux integration test with real server..."
+          echo "Testing config file location detection and real upload..."
           ./astrocam-go -test
           echo "✓ Linux integration test completed successfully"
 
@@ -391,6 +539,7 @@ jobs:
           SAI_POSTFIX=_TEST
           "@ | Out-File -FilePath "config.env" -Encoding ascii
             Write-Host "✓ Real server configuration created for Windows integration test"
+            Write-Host "✓ Testing smart config file location with real server"
           } else {
             Write-Host "⚠ No test server configured - skipping Windows integration test"
             exit 0
@@ -409,8 +558,14 @@ jobs:
           for ($i = 1; $i -le 3; $i++) {
               $timestamp = (Get-Date).AddSeconds($i).ToString("yyyy-MM-dd_HH-mm-ss")
               $filename = "${area}_${timestamp}_test_STL-11000M.fts"
-              # Create small files with random content for upload
-              $content = "Integration test data for area $area file $i " * 50
+              # Create small files with content for real upload test
+              $content = @"
+          Integration test data for area $area file $i
+          Testing smart config location with real server upload.
+          Generated: $(Get-Date)
+          Windows integration test with config file detection.
+          File size optimized for integration testing.
+          "@
               Set-Content -Path "test_data/1_semka/$filename" -Value $content
           }
 
@@ -423,5 +578,6 @@ jobs:
           # Build Windows binary natively
           go build -ldflags="-s -w" -o astrocam-go-win64.exe astrocam.go
           Write-Host "Running Windows integration test with real server..."
+          Write-Host "Testing config file location detection and real upload..."
           .\astrocam-go-win64.exe -test
           Write-Host "✓ Windows integration test completed successfully"

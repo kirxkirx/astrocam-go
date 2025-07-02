@@ -68,27 +68,70 @@ jobs:
           cat > astrocam-${{ steps.version.outputs.version }}/install-linux.sh << 'EOF'
           #!/bin/bash
           echo "Installing AstroCam for Linux..."
+          
+          # Create installation directory
           sudo mkdir -p /opt/astrocam
-          sudo cp astrocam-linux-amd64 /opt/astrocam/astrocam
-          sudo cp config.env.example /opt/astrocam/config.env
-          sudo cp areas.txt /opt/astrocam/
+          echo "✓ Created /opt/astrocam directory"
+          
+          # Copy files with verbose output
+          echo "Copying executable..."
+          sudo cp -v astrocam-linux-amd64 /opt/astrocam/astrocam
           sudo chmod +x /opt/astrocam/astrocam
-          echo "✓ AstroCam installed to /opt/astrocam/"
-          echo "Edit /opt/astrocam/config.env with your settings and /opt/astrocam/areas.txt with your sky field names (filename prefixes)"
-          echo "Run: cd /opt/astrocam && ./astrocam"
+          
+          echo "Copying configuration files..."
+          sudo cp -v config.env.example /opt/astrocam/config.env
+          sudo cp -v areas.txt /opt/astrocam/
+          sudo cp -v README.md /opt/astrocam/ 2>/dev/null || echo "README.md not found, skipping"
+          
+          echo ""
+          echo "========================================="
+          echo "✓ AstroCam installed successfully!"
+          echo "========================================="
+          echo "Installation location: /opt/astrocam/"
+          echo ""
+          echo "Next steps:"
+          echo "1. Edit configuration: sudo nano /opt/astrocam/config.env"
+          echo "2. Edit sky areas: sudo nano /opt/astrocam/areas.txt"
+          echo "3. Test installation: cd /opt/astrocam && sudo ./astrocam -test"
+          echo "4. Run normally: cd /opt/astrocam && sudo ./astrocam"
+          echo ""
+          echo "Config files are automatically found next to the executable!"
+          echo "No need to copy config files to working directory."
           EOF
           
           cat > astrocam-${{ steps.version.outputs.version }}/install-windows.bat << 'EOF'
           @echo off
           echo Installing AstroCam for Windows...
-          if not exist "C:\AstroCam" mkdir "C:\AstroCam"
-          copy astrocam-windows-amd64.exe "C:\AstroCam\astrocam.exe"
-          copy config.env.example "C:\AstroCam\config.env"
-          copy areas.txt "C:\AstroCam\"
           echo.
-          echo ✓ AstroCam installed to C:\AstroCam\
-          echo Edit C:\AstroCam\config.env with your settings and C:\AstroCam\areas.txt with your sky field names (filename prefixes)
-          echo Run from: cd C:\AstroCam && astrocam.exe
+          
+          REM Create installation directory
+          if not exist "C:\AstroCam" (
+              mkdir "C:\AstroCam"
+              echo Created C:\AstroCam directory
+          )
+          
+          REM Copy files
+          echo Copying files...
+          copy /v astrocam-windows-amd64.exe "C:\AstroCam\astrocam.exe"
+          copy /v config.env.example "C:\AstroCam\config.env"
+          copy /v areas.txt "C:\AstroCam\"
+          copy /v README.md "C:\AstroCam\" 2>nul
+          
+          echo.
+          echo =========================================
+          echo ^✓ AstroCam installed successfully!
+          echo =========================================
+          echo Installation location: C:\AstroCam\
+          echo.
+          echo Next steps:
+          echo 1. Edit configuration: notepad C:\AstroCam\config.env
+          echo 2. Edit sky areas: notepad C:\AstroCam\areas.txt
+          echo 3. Test installation: cd C:\AstroCam ^&^& astrocam.exe -test
+          echo 4. Run normally: cd C:\AstroCam ^&^& astrocam.exe
+          echo.
+          echo Config files are automatically found next to the executable!
+          echo No need to copy config files to working directory.
+          echo.
           pause
           EOF
           
@@ -104,55 +147,149 @@ jobs:
           cat > release_notes.md << EOF
           # AstroCam ${{ steps.version.outputs.version }}
           
-          ## Download Options
+          ## 🚀 Key Features
+          
+          ### ✅ **Intelligent Configuration Management**
+          - **Smart Config Lookup**: Automatically finds config files next to executable, then falls back to current directory
+          - **Flexible Deployment**: No need to copy config files to working directory
+          - **Cross-Platform Paths**: Handles Windows/Linux path differences automatically
+          
+          ### ✅ **Automatic Archive Format Detection**
+          - **RAR Format**: Uses external \`rar\` command when available (better compression)
+          - **ZIP Fallback**: Built-in ZIP support when RAR unavailable (no dependencies)
+          - **Runtime Detection**: Automatically chooses best available format at startup
+          
+          ### ✅ **Robust Operation Modes**
+          - **Production Mode**: Continuous monitoring with graceful error handling
+          - **Test Mode**: Automated testing with 2-minute timeout for CI/CD pipelines
+          - **Upload Throttling**: 120-second delays between uploads to prevent server overload
+          
+          ### ✅ **Enhanced Authentication & Security**
+          - **Flexible Auth**: Works with or without credentials (handles empty username/password)
+          - **HTTP Basic Auth**: Secure authentication when credentials provided
+          - **Credential Detection**: Automatically detects and handles whitespace-only credentials
+          
+          ## 📦 Download Options
           
           ### Individual Binaries
           - **Linux (64-bit)**: \`astrocam-linux-amd64\`
           - **Windows (64-bit)**: \`astrocam-windows-amd64.exe\` (recommended for modern Windows)
           - **Windows (32-bit)**: \`astrocam-windows-386.exe\` (for legacy Windows systems)
           
-          ### Complete Packages
+          ### Complete Packages (Recommended)
           - **All platforms**: \`astrocam-${{ steps.version.outputs.version }}-complete.tar.gz\` or \`astrocam-${{ steps.version.outputs.version }}-complete.zip\`
-          - Includes all binaries, configuration templates, and installation scripts
+          - Includes all binaries, configuration templates, and automated installation scripts
+          - Ready-to-deploy with verbose installation feedback
           
-          ## Quick Start
+          ## 🔧 Quick Start
           
           ### Linux Installation
           \`\`\`bash
-          # Download and extract
-          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/astrocam-linux-amd64
-          chmod +x astrocam-linux-amd64
-          
-          # Or use the complete package with installer
+          # Option 1: Complete package (recommended)
+          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/astrocam-${{ steps.version.outputs.version }}-complete.tar.gz
           tar -xzf astrocam-${{ steps.version.outputs.version }}-complete.tar.gz
           cd astrocam-${{ steps.version.outputs.version }}
           ./install-linux.sh
+          
+          # Option 2: Individual binary
+          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/astrocam-linux-amd64
+          chmod +x astrocam-linux-amd64
+          ./astrocam-linux-amd64 -version
           \`\`\`
           
           ### Windows Installation
-          1. Download \`astrocam-windows-amd64.exe\` (or complete package)
-          2. Run \`install-windows.bat\` (if using complete package)
-          3. Edit \`config.env\` with your settings
-          4. Run \`astrocam.exe\`
+          1. Download \`astrocam-${{ steps.version.outputs.version }}-complete.zip\`
+          2. Extract to a folder
+          3. Run \`install-windows.bat\` as Administrator
+          4. Edit \`C:\\AstroCam\\config.env\` with your settings
+          5. Run \`C:\\AstroCam\\astrocam.exe -test\` to verify
           
-          ## Configuration
+          ## ⚙️ Configuration
+          
+          ### Smart Config File Location
+          AstroCam now automatically finds configuration files in this order:
+          1. **Next to executable** (preferred for deployed installations)
+          2. **Current working directory** (fallback for development)
+          
+          ### Setup Steps
           1. Copy \`config.env.example\` to \`config.env\`
-          2. Edit with your server details and directories
-          3. Ensure \`areas.txt\` contains your area codes
+          2. Edit server URL, credentials, and directories
+          3. Ensure \`areas.txt\` contains your sky field prefixes
+          4. Test with: \`./astrocam -test\`
           
-          ## Archive Formats
-          - **RAR**: Used if \`rar\` command available (better compression)
-          - **ZIP**: Built-in fallback (no external dependencies)
-          
-          ## Verification
-          Use the provided \`checksums.txt\` to verify download integrity:
+          ### Example Configuration
           \`\`\`bash
+          SAI_SERVER=https://your-server.com/upload.py
+          SAI_USERNAME=your_username      # Optional: leave empty for no auth
+          SAI_PASSWORD=your_password      # Optional: leave empty for no auth
+          SAI_CAMERA_DIRECTORY=/path/to/camera/images
+          SAI_PROCESSED_DIRECTORY=/path/to/processed/images
+          SAI_INTERVAL=10                 # Scan interval in seconds
+          SAI_COUNT=3                     # Files per archive
+          \`\`\`
+          
+          ## 🔍 Archive Formats & Dependencies
+          
+          ### RAR (Preferred)
+          - **Windows**: Install WinRAR (includes command line tools)
+          - **Linux**: \`sudo apt install rar\` or \`sudo yum install rar\`
+          - **Benefits**: Better compression, same format as original Python version
+          
+          ### ZIP (Universal Fallback)
+          - **No Dependencies**: Built into Go executable
+          - **Cross-Platform**: Works everywhere without additional software
+          - **Automatic**: Used when \`rar\` command not detected
+          
+          ## ✅ Verification & Testing
+          
+          ### Verify Download Integrity
+          \`\`\`bash
+          # Download checksums file
+          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/checksums.txt
+          
+          # Verify binaries
           sha256sum -c checksums.txt
           \`\`\`
           
+          ### Test Your Installation
+          \`\`\`bash
+          # Quick test (exits after 2 minutes if no files)
+          ./astrocam -test
+          
+          # Show version
+          ./astrocam -version
+          
+          # Normal operation
+          ./astrocam
+          \`\`\`
+          
+          ## 🔄 Migration from Python Version
+          
+          1. **Stop** the Python astrocam service
+          2. **Backup** your current \`config.env\` and \`areas.txt\`
+          3. **Install** Go version using complete package
+          4. **Copy** your config files to installation directory
+          5. **Test** with \`./astrocam -test\`
+          6. **Deploy** and remove Python version
+          
+          The Go version is a **drop-in replacement** with improved reliability and performance.
+          
+          ## 🚨 Troubleshooting
+          
+          ### Common Issues
+          - **"rar command not found"**: System automatically uses ZIP format
+          - **HTTP 401/403 errors**: Check username/password in config.env
+          - **File move errors**: System retries automatically, then continues
+          - **Test timeout**: Normal behavior when no files present in test mode
+          
+          ### Getting Help
+          - Check the complete README.md in the package
+          - Review configuration examples
+          - Run with \`-test\` flag for validation
+          
           ---
           
-          **Full documentation**: See README.md in the complete package or [repository](https://github.com/${{ github.repository }})
+          **Full Documentation**: [Repository README](https://github.com/${{ github.repository }}) | **Issues**: [Report Bugs](https://github.com/${{ github.repository }}/issues)
           EOF
           
           echo "release_notes<<EOF" >> $GITHUB_OUTPUT
