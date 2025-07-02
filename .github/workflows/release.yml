@@ -74,7 +74,7 @@ jobs:
           sudo cp areas.txt /opt/astrocam/
           sudo chmod +x /opt/astrocam/astrocam
           echo "✓ AstroCam installed to /opt/astrocam/"
-          echo "Edit /opt/astrocam/config.env with your settings"
+          echo "Edit /opt/astrocam/config.env with your settings and /opt/astrocam/areas.txt with your sky field names (filename prefixes)"
           echo "Run: cd /opt/astrocam && ./astrocam"
           EOF
           
@@ -87,7 +87,7 @@ jobs:
           copy areas.txt "C:\AstroCam\"
           echo.
           echo ✓ AstroCam installed to C:\AstroCam\
-          echo Edit C:\AstroCam\config.env with your settings
+          echo Edit C:\AstroCam\config.env with your settings and C:\AstroCam\areas.txt with your sky field names (filename prefixes)
           echo Run from: cd C:\AstroCam && astrocam.exe
           pause
           EOF
@@ -120,7 +120,7 @@ jobs:
           ### Linux Installation
           \`\`\`bash
           # Download and extract
-          wget https://github.com/\${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/astrocam-linux-amd64
+          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/astrocam-linux-amd64
           chmod +x astrocam-linux-amd64
           
           # Or use the complete package with installer

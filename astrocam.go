@@ -57,20 +57,72 @@ type FileGroup struct {
 	FilesToDelete  []string
 }
 
+// ... existing imports and type definitions stay the same ...
+
+type AstroCam struct {
+	config         *Config
+	areas          []string
+	tempDirectory  string
+	currentDir     string
+	lastUploadTime time.Time
+	useRAR         bool   
+	archiveExt     string 
+	testMode       bool   
+	testStartTime  time.Time
+}
+
+type FileGroup struct {
+	FilesToArchive []string
+	FilesToDelete  []string
+}
+
+// ADD THIS NEW FUNCTION HERE:
+// findConfigFile looks for a config file in multiple locations:
+// 1. Next to the executable (preferred)
+// 2. Current working directory (fallback)
+func findConfigFile(filename string) (string, error) {
+	// Get executable directory
+	execPath, err := os.Executable()
+	if err == nil {
+		execDir := filepath.Dir(execPath)
+		configPath := filepath.Join(execDir, filename)
+		if _, err := os.Stat(configPath); err == nil {
+			return configPath, nil
+		}
+	}
+	
+	// Fall back to current directory
+	if _, err := os.Stat(filename); err == nil {
+		return filename, nil
+	}
+	
+	return "", fmt.Errorf("config file %s not found in executable directory or current directory", filename)
+}
+
+// REPLACE THE EXISTING loadConfig() FUNCTION WITH THIS:
 func loadConfig() *Config {
 	config := &Config{
 		Interval: 180, // default
 		Count:    3,   // default
 	}
 
-	// Read config.env file (matching Python Environ class)
-	file, err := os.Open("config.env")
+	// Look for config.env in executable directory first, then current directory
+	configPath, err := findConfigFile("config.env")
+	if err != nil {
+		log.Printf("Warning: Could not find config.env: %v", err)
+		return config
+	}
+
+	file, err := os.Open(configPath)
 	if err != nil {
 		log.Printf("Warning: Could not read config.env: %v", err)
 		return config
 	}
 	defer file.Close()
 
+	log.Printf("Using config file: %s", configPath)
+
+	// Rest of the logic stays exactly the same
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -113,13 +165,23 @@ func loadConfig() *Config {
 	return config
 }
 
+// REPLACE THE EXISTING loadAreas() FUNCTION WITH THIS:
 func loadAreas() ([]string, error) {
-	file, err := os.Open("areas.txt")
+	// Look for areas.txt in executable directory first, then current directory
+	areasPath, err := findConfigFile("areas.txt")
+	if err != nil {
+		return nil, fmt.Errorf("could not find areas.txt: %w", err)
+	}
+
+	file, err := os.Open(areasPath)
 	if err != nil {
 		return nil, fmt.Errorf("could not open areas.txt: %w", err)
 	}
 	defer file.Close()
 
+	log.Printf("Using areas file: %s", areasPath)
+
+	// Rest of the logic stays exactly the same
 	var areas []string
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -130,6 +192,7 @@ func loadAreas() ([]string, error) {
 	}
 	return areas, scanner.Err()
 }
+
 
 // checkRARAvailability checks if rar command is available
 func checkRARAvailability() bool {
