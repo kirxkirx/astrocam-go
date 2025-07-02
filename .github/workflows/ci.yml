@@ -339,20 +339,12 @@ jobs:
           Write-Host "Testing archive creation and file processing on Windows..."
           Write-Host "This tests smart config lookup and archive format detection"
           
-          # Run the test and capture exit code (upload failure is expected)
-          $timeoutJob = Start-Job -ScriptBlock { 
-              & ".\astrocam-go-win64.exe" -test 
+          # Run the test and handle expected failure (like Linux test does)
+          try {
+              .\astrocam-go-win64.exe -test
+          } catch {
+              Write-Host "Expected timeout or upload failure"
           }
-          
-          # Wait up to 30 seconds for processing
-          $result = Wait-Job $timeoutJob -Timeout 30
-          if ($result) {
-              $output = Receive-Job $timeoutJob
-              Write-Host $output
-          } else {
-              Write-Host "Test timed out (expected behavior)"
-          }
-          Remove-Job $timeoutJob -Force
 
           Write-Host "Checking created archives:"
           if (Test-Path temp) {
@@ -384,6 +376,54 @@ jobs:
               }
           } else {
               Write-Host "✗ Archive creation test FAILED - no archives created"
+              exit 1
+          }
+
+          Write-Host "Checking created archives:"
+          if (Test-Path temp) {
+              $archives = Get-ChildItem temp/ -ErrorAction SilentlyContinue
+              if ($archives) {
+                  $archives | ForEach-Object { Write-Host "  $($_.Name)" }
+              } else {
+                  Write-Host "  (no archives found)"
+              }
+          } else {
+              Write-Host "  (temp directory not found)"
+          }
+
+          Write-Host "Checking processed files:"
+          if (Test-Path test_data/2_otpravleno) {
+              $processed = Get-ChildItem test_data/2_otpravleno/ -ErrorAction SilentlyContinue
+              if ($processed) {
+                  $processed | ForEach-Object { Write-Host "  $($_.Name)" }
+              } else {
+                  Write-Host "  (no processed files)"
+              }
+          } else {
+              Write-Host "  (processed directory not found)"
+          }
+
+          # Verify at least some archives were created (this is the real test)
+          # The upload failure is expected, but archive creation should work
+          $rarFiles = Get-ChildItem temp/*.rar -ErrorAction SilentlyContinue
+          $zipFiles = Get-ChildItem temp/*.zip -ErrorAction SilentlyContinue
+          
+          if ($rarFiles -or $zipFiles) {
+              Write-Host "✓ Archive creation test PASSED (upload failure expected with mock server)"
+              
+              # Check which format was used
+              if ($rarFiles) {
+                  Write-Host "✓ RAR format used (rar command available)"
+              }
+              if ($zipFiles) {
+                  Write-Host "✓ ZIP format used (built-in or fallback)"
+              }
+              
+              # Success despite upload failure - this is what we want to test
+              Write-Host "✓ Key functionality verified: config detection, archive creation, file processing"
+          } else {
+              Write-Host "✗ Archive creation test FAILED - no archives created"
+              Write-Host "This indicates a problem with archive creation, not just upload failure"
               exit 1
           }
 
