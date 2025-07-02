@@ -1,9 +1,4 @@
-In your .github/workflows/ci.yml file, change this line:
-
-yaml
-
-# Change this:
-uses: actions/upload-artifact@v4name: AstroCam CI
+name: AstroCam CI
 
 on:
   push:
@@ -14,172 +9,171 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.21'
-        
-    - name: Verify Go installation
-      run: go version
-      
-    - name: Create test configuration
-      run: |
-        # Create test config with mock server (will fail upload, but tests archive creation)
-        cat > config.env << EOF
-        SAI_SERVER=http://localhost:9999/mock-upload
-        SAI_USERNAME=test_user
-        SAI_PASSWORD=test_pass
-        SAI_CAMERA_DIRECTORY=test_data/1_semka
-        SAI_PROCESSED_DIRECTORY=test_data/2_otpravleno
-        SAI_INTERVAL=10
-        SAI_COUNT=3
-        SAI_PREFIX=CI_
-        SAI_POSTFIX=_TEST
-        EOF
-        
-    - name: Prepare test data
-      run: |
-        # Create test directory structure
-        mkdir -p test_data/1_semka test_data/2_otpravleno temp
-        
-        # Create mock FITS files for testing
-        for area in 064 091 092; do
-          for i in {1..3}; do
-            timestamp=$(date +"%Y-%m-%d_%H-%M-%S" -d "+$i seconds")
-            filename="${area}_${timestamp}_test_STL-11000M.fts"
-            # Create files with some content to test archiving
-            dd if=/dev/urandom of="test_data/1_semka/$filename" bs=1024 count=100 2>/dev/null
-          done
-        done
-        
-        echo "Created test files:"
-        ls -la test_data/1_semka/
-        
-    - name: Build Linux version
-      run: |
-        go build -o astrocam-go astrocam.go
-        echo "Linux build successful"
-        
-    - name: Build Windows versions
-      run: |
-        GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o astrocam-go-win64.exe astrocam.go
-        GOOS=windows GOARCH=386 go build -ldflags="-s -w" -o astrocam-go-win32.exe astrocam.go
-        echo "Windows builds successful"
-        ls -lh astrocam*
-        
-    - name: Test archive creation (dry-run mode)
-      run: |
-        # Test archive creation without upload
-        echo "Testing archive creation and file processing..."
-        timeout 600 ./astrocam -test || true
-        
-        echo "Checking created archives:"
-        ls -la temp/ || echo "No archives created"
-        
-        echo "Checking processed files:"
-        ls -la test_data/2_otpravleno/ || echo "No files moved"
-        
-        # Verify at least some archives were created
-        if ls temp/*.rar >/dev/null 2>&1 || ls temp/*.zip >/dev/null 2>&1; then
-          echo "✓ Archive creation test PASSED"
-        else
-          echo "✗ Archive creation test FAILED - no archives created"
-          exit 1
-        fi
-        
-    - name: Test archive integrity
-      run: |
-        echo "Testing archive integrity..."
-        
-        # Test RAR archives if they exist
-        for rar_file in temp/*.rar; do
-          if [ -f "$rar_file" ]; then
-            echo "Testing RAR archive: $rar_file"
-            rar t "$rar_file"
-            echo "✓ RAR archive integrity test passed"
-          fi
-        done
-        
-        # Test ZIP archives if they exist  
-        for zip_file in temp/*.zip; do
-          if [ -f "$zip_file" ]; then
-            echo "Testing ZIP archive: $zip_file"
-            unzip -t "$zip_file"
-            echo "✓ ZIP archive integrity test passed"
-          fi
-        done
-        
-    - name: Upload test artifacts
-      uses: actions/upload-artifact@v3
-      if: always()
-      with:
-        name: test-results
-        path: |
-          temp/
-          test_data/
-          *.log
-        retention-days: 7
 
-  # Optional: Test with real server (using secrets)
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Verify Go installation
+        run: go version
+
+      - name: Create test configuration
+        run: |
+          # Create test config with mock server (will fail upload, but tests archive creation)
+          cat > config.env << EOF
+          SAI_SERVER=http://localhost:9999/mock-upload
+          SAI_USERNAME=test_user
+          SAI_PASSWORD=test_pass
+          SAI_CAMERA_DIRECTORY=test_data/1_semka
+          SAI_PROCESSED_DIRECTORY=test_data/2_otpravleno
+          SAI_INTERVAL=10
+          SAI_COUNT=3
+          SAI_PREFIX=CI_
+          SAI_POSTFIX=_TEST
+          EOF
+
+      - name: Prepare test data
+        run: |
+          # Create test directory structure
+          mkdir -p test_data/1_semka test_data/2_otpravleno temp
+
+          # Create mock FITS files for testing
+          for area in 064 091 092; do
+            for i in {1..3}; do
+              timestamp=$(date +"%Y-%m-%d_%H-%M-%S" -d "+$i seconds")
+              filename="${area}_${timestamp}_test_STL-11000M.fts"
+              # Create files with some content to test archiving
+              dd if=/dev/urandom of="test_data/1_semka/$filename" bs=1024 count=100 2>/dev/null
+            done
+          done
+
+          echo "Created test files:"
+          ls -la test_data/1_semka/
+
+      - name: Build Linux version
+        run: |
+          go build -o astrocam-go astrocam.go
+          echo "Linux build successful"
+
+      - name: Build Windows versions
+        run: |
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o astrocam-go-win64.exe astrocam.go
+          GOOS=windows GOARCH=386 go build -ldflags="-s -w" -o astrocam-go-win32.exe astrocam.go
+          echo "Windows builds successful"
+          ls -lh astrocam*
+
+      - name: Test archive creation (dry-run mode)
+        run: |
+          # Test archive creation without upload
+          echo "Testing archive creation and file processing..."
+          timeout 600 ./astrocam -test || true
+
+          echo "Checking created archives:"
+          ls -la temp/ || echo "No archives created"
+
+          echo "Checking processed files:"
+          ls -la test_data/2_otpravleno/ || echo "No files moved"
+
+          # Verify at least some archives were created
+          if ls temp/*.rar >/dev/null 2>&1 || ls temp/*.zip >/dev/null 2>&1; then
+            echo "✓ Archive creation test PASSED"
+          else
+            echo "✗ Archive creation test FAILED - no archives created"
+            exit 1
+          fi
+
+      - name: Test archive integrity
+        run: |
+          echo "Testing archive integrity..."
+
+          # Test RAR archives if they exist
+          for rar_file in temp/*.rar; do
+            if [ -f "$rar_file" ]; then
+              echo "Testing RAR archive: $rar_file"
+              rar t "$rar_file"
+              echo "✓ RAR archive integrity test passed"
+            fi
+          done
+
+          # Test ZIP archives if they exist
+          for zip_file in temp/*.zip; do
+            if [ -f "$zip_file" ]; then
+              echo "Testing ZIP archive: $zip_file"
+              unzip -t "$zip_file"
+              echo "✓ ZIP archive integrity test passed"
+            fi
+          done
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results
+          path: |
+            temp/
+            test_data/
+            *.log
+          retention-days: 7
+
   integration-test:
     runs-on: ubuntu-latest
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.21'
-        
-    - name: Create real test configuration
-      env:
-        TEST_SERVER_URL: ${{ secrets.TEST_SERVER_URL }}
-        TEST_USERNAME: ${{ secrets.TEST_USERNAME }}  
-        TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
-      run: |
-        if [ -n "$TEST_SERVER_URL" ]; then
-          cat > config.env << EOF
-        SAI_SERVER=${TEST_SERVER_URL}
-        SAI_USERNAME=${TEST_USERNAME}
-        SAI_PASSWORD=${TEST_PASSWORD}
-        SAI_CAMERA_DIRECTORY=test_data/1_semka
-        SAI_PROCESSED_DIRECTORY=test_data/2_otpravleno
-        SAI_INTERVAL=10
-        SAI_COUNT=3
-        SAI_PREFIX=CI_
-        SAI_POSTFIX=_TEST
-        EOF
-          echo "✓ Real server configuration created"
-        else
-          echo "⚠ No test server configured - skipping integration test"
-          exit 0
-        fi
-        
-    - name: Prepare integration test data
-      run: |
-        mkdir -p test_data/1_semka test_data/2_otpravleno temp
-        
-        # Create smaller test files for real upload
-        for area in 064; do  # Just one area for integration test
-          for i in {1..3}; do
-            timestamp=$(date +"%Y-%m-%d_%H-%M-%S" -d "+$i seconds")
-            filename="${area}_${timestamp}_test_STL-11000M.fts"
-            dd if=/dev/urandom of="test_data/1_semka/$filename" bs=1024 count=10 2>/dev/null
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Create real test configuration
+        env:
+          TEST_SERVER_URL: ${{ secrets.TEST_SERVER_URL }}
+          TEST_USERNAME: ${{ secrets.TEST_USERNAME }}
+          TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
+        run: |
+          if [ -n "$TEST_SERVER_URL" ]; then
+            cat > config.env << EOF
+          SAI_SERVER=${TEST_SERVER_URL}
+          SAI_USERNAME=${TEST_USERNAME}
+          SAI_PASSWORD=${TEST_PASSWORD}
+          SAI_CAMERA_DIRECTORY=test_data/1_semka
+          SAI_PROCESSED_DIRECTORY=test_data/2_otpravleno
+          SAI_INTERVAL=10
+          SAI_COUNT=3
+          SAI_PREFIX=CI_
+          SAI_POSTFIX=_TEST
+          EOF
+            echo "✓ Real server configuration created"
+          else
+            echo "⚠ No test server configured - skipping integration test"
+            exit 0
+          fi
+
+      - name: Prepare integration test data
+        run: |
+          mkdir -p test_data/1_semka test_data/2_otpravleno temp
+
+          # Create smaller test files for real upload
+          for area in 064; do  # Just one area for integration test
+            for i in {1..3}; do
+              timestamp=$(date +"%Y-%m-%d_%H-%M-%S" -d "+$i seconds")
+              filename="${area}_${timestamp}_test_STL-11000M.fts"
+              dd if=/dev/urandom of="test_data/1_semka/$filename" bs=1024 count=10 2>/dev/null
+            done
           done
-        done
-        
-    - name: Build and run integration test
-      run: |
-        go build -o astrocam-go astrocam.go
-        echo "Running integration test with real server..."
-        timeout 600 ./astrocam-go -test
-        echo "✓ Integration test completed successfully"
+
+      - name: Build and run integration test
+        run: |
+          go build -o astrocam-go astrocam.go
+          echo "Running integration test with real server..."
+          timeout 600 ./astrocam-go -test
+          echo "✓ Integration test completed successfully"
