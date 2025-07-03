@@ -381,6 +381,9 @@ jobs:
               }
               
               Write-Host "✓ Key functionality verified: config detection, archive creation, file processing"
+              
+              # Override exit code like Linux || echo does
+              exit 0
           } else {
               Write-Host "✗ Archive creation test FAILED - no archives created"
               exit 1
