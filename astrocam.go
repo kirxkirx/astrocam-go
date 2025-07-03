@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,6 +39,7 @@ type Config struct {
 	Count              int
 	Prefix             string
 	Postfix            string
+	ArchiveMode        string // "auto", "rar", "zip", "zip-uncompressed"
 }
 
 type AstroCam struct {
@@ -48,6 +50,8 @@ type AstroCam struct {
 	lastUploadTime time.Time
 	useRAR         bool   // Whether to use RAR (true) or ZIP (false)
 	archiveExt     string // ".rar" or ".zip"
+	zipCompressed  bool   // Whether to compress ZIP files
+	rarPath        string // Path to rar executable (if found)
 	testMode       bool   // Whether running in test mode
 	testStartTime  time.Time
 }
@@ -81,8 +85,9 @@ func findConfigFile(filename string) (string, error) {
 
 func loadConfig() *Config {
 	config := &Config{
-		Interval: 180, // default
-		Count:    3,   // default
+		Interval:    180,    // default
+		Count:       3,      // default
+		ArchiveMode: "auto", // default
 	}
 
 	// Look for config.env in executable directory first, then current directory
@@ -137,6 +142,11 @@ func loadConfig() *Config {
 			config.Prefix = value
 		case "SAI_POSTFIX":
 			config.Postfix = value
+		case "SAI_ARCHIVE_MODE":
+			mode := strings.TrimSpace(strings.ToLower(value))
+			if mode != "" {
+				config.ArchiveMode = mode
+			}
 		}
 	}
 
@@ -169,10 +179,70 @@ func loadAreas() ([]string, error) {
 	return areas, scanner.Err()
 }
 
-// checkRARAvailability checks if rar command is available
-func checkRARAvailability() bool {
-	_, err := exec.LookPath("rar")
-	return err == nil
+// findRARExecutable checks for rar command in PATH and Windows default locations
+func findRARExecutable() (string, bool) {
+	// First try PATH (works on Linux and Windows if rar is in PATH)
+	if rarPath, err := exec.LookPath("rar"); err == nil {
+		return rarPath, true
+	}
+	
+	// On Windows, also check common WinRAR installation locations
+	if runtime.GOOS == "windows" {
+		commonPaths := []string{
+			`C:\Program Files\WinRAR\rar.exe`,
+			`C:\Program Files (x86)\WinRAR\rar.exe`,
+		}
+		
+		for _, path := range commonPaths {
+			if _, err := os.Stat(path); err == nil {
+				return path, true
+			}
+		}
+	}
+	
+	return "", false
+}
+
+// determineArchiveSettings determines archive format based on config and availability
+func determineArchiveSettings(config *Config) (useRAR bool, zipCompressed bool, archiveExt string, rarPath string) {
+	rarPath, rarAvailable := findRARExecutable()
+	
+	// Set defaults
+	useRAR = false
+	zipCompressed = true
+	archiveExt = ".zip"
+	
+	switch config.ArchiveMode {
+	case "rar":
+		if rarAvailable {
+			useRAR = true
+			archiveExt = ".rar"
+		} else {
+			fmt.Printf("Warning: RAR mode requested but rar command not found, falling back to compressed ZIP\n")
+		}
+	case "zip":
+		useRAR = false
+		zipCompressed = true
+		archiveExt = ".zip"
+	case "zip-uncompressed":
+		useRAR = false
+		zipCompressed = false
+		archiveExt = ".zip"
+	case "auto":
+		fallthrough
+	default:
+		// Auto mode: prefer RAR if available, otherwise compressed ZIP
+		if rarAvailable {
+			useRAR = true
+			archiveExt = ".rar"
+		} else {
+			useRAR = false
+			zipCompressed = true
+			archiveExt = ".zip"
+		}
+	}
+	
+	return useRAR, zipCompressed, archiveExt, rarPath
 }
 
 func NewAstroCam(testMode bool) (*AstroCam, error) {
@@ -182,12 +252,8 @@ func NewAstroCam(testMode bool) (*AstroCam, error) {
 		return nil, err
 	}
 
-	// Check RAR availability and set archive type
-	useRAR := checkRARAvailability()
-	archiveExt := ".zip" // default to ZIP
-	if useRAR {
-		archiveExt = ".rar"
-	}
+	// Determine archive settings based on config
+	useRAR, zipCompressed, archiveExt, rarPath := determineArchiveSettings(config)
 
 	// Display mode and archive type information
 	modeStr := "NORMAL OPERATION"
@@ -195,19 +261,18 @@ func NewAstroCam(testMode bool) (*AstroCam, error) {
 		modeStr = "TEST"
 	}
 	
-	archiveType := "ZIP"
+	var archiveTypeDesc string
 	if useRAR {
-		archiveType = "RAR"
+		archiveTypeDesc = fmt.Sprintf("RAR (using %s)", rarPath)
+	} else if zipCompressed {
+		archiveTypeDesc = "ZIP compressed (built-in)"
+	} else {
+		archiveTypeDesc = "ZIP uncompressed (built-in)"
 	}
 	
 	fmt.Printf("=== ASTROCAM STARTING IN %s MODE ===\n", modeStr)
-	fmt.Printf("Archive format: %s %s\n", archiveType, 
-		func() string {
-			if useRAR {
-				return "(rar command available)"
-			}
-			return "(rar command not found, using built-in ZIP)"
-		}())
+	fmt.Printf("Archive mode: %s\n", config.ArchiveMode)
+	fmt.Printf("Archive format: %s\n", archiveTypeDesc)
 
 	// Determine executable directory (matching Python logic)
 	execPath, err := os.Executable()
@@ -246,6 +311,8 @@ func NewAstroCam(testMode bool) (*AstroCam, error) {
 		lastUploadTime: time.Time{},
 		useRAR:        useRAR,
 		archiveExt:    archiveExt,
+		zipCompressed: zipCompressed,
+		rarPath:       rarPath,
 		testMode:      testMode,
 		testStartTime: time.Now(),
 	}, nil
@@ -491,7 +558,13 @@ func (ac *AstroCam) addFileToZip(zipWriter *zip.Writer, filename string) error {
 	}
 
 	header.Name = filepath.Base(filename)
-	header.Method = zip.Deflate
+	
+	// Set compression method based on configuration
+	if ac.zipCompressed {
+		header.Method = zip.Deflate
+	} else {
+		header.Method = zip.Store // No compression
+	}
 
 	writer, err := zipWriter.CreateHeader(header)
 	if err != nil {
@@ -533,7 +606,7 @@ func (ac *AstroCam) createRARArchive(archiveFileName string, files []string) err
 	args := []string{"a", "-ep1", archiveFileName}
 	args = append(args, files...)
 	
-	cmd := exec.Command("rar", args...)
+	cmd := exec.Command(ac.rarPath, args...)
 	
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -545,7 +618,7 @@ func (ac *AstroCam) createRARArchive(archiveFileName string, files []string) err
 
 // testRARArchive tests RAR archive integrity
 func (ac *AstroCam) testRARArchive(archiveFileName string) error {
-	cmd := exec.Command("rar", "t", archiveFileName)
+	cmd := exec.Command(ac.rarPath, "t", archiveFileName)
 	
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -628,13 +701,16 @@ func (ac *AstroCam) packImagesForArea(area string) (string, error) {
 	}
 
 	// Create archive
-	fmt.Printf("Creating %s archive: %s\n", 
-		func() string {
-			if ac.useRAR {
-				return "RAR"
-			}
-			return "ZIP"
-		}(), filepath.Base(archiveFileName))
+	var archiveTypeStr string
+	if ac.useRAR {
+		archiveTypeStr = "RAR"
+	} else if ac.zipCompressed {
+		archiveTypeStr = "ZIP"
+	} else {
+		archiveTypeStr = "ZIP (uncompressed)"
+	}
+	
+	fmt.Printf("Creating %s archive: %s\n", archiveTypeStr, filepath.Base(archiveFileName))
 	
 	if err := ac.createArchive(archiveFileName, fileGroup.FilesToArchive); err != nil {
 		if ac.testMode {
@@ -872,7 +948,17 @@ func (ac *AstroCam) run() {
 	fmt.Printf("  Camera directory: %s\n", ac.config.CameraDirectory)
 	fmt.Printf("  Processed directory: %s\n", ac.config.ProcessedDirectory)
 	fmt.Printf("  Temp directory: %s\n", ac.tempDirectory)
-	fmt.Printf("  Archive format: %s\n", strings.ToUpper(ac.archiveExt[1:]))
+	fmt.Printf("  Archive mode: %s\n", ac.config.ArchiveMode)
+	
+	var archiveFormatDesc string
+	if ac.useRAR {
+		archiveFormatDesc = fmt.Sprintf("RAR (using %s)", ac.rarPath)
+	} else if ac.zipCompressed {
+		archiveFormatDesc = "ZIP compressed"
+	} else {
+		archiveFormatDesc = "ZIP uncompressed"
+	}
+	fmt.Printf("  Archive format: %s\n", archiveFormatDesc)
 	
 	if ac.hasCredentials() {
 		fmt.Printf("  Authentication: Enabled (username: %s)\n", ac.config.Username)
