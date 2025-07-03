@@ -603,6 +603,11 @@ func (ac *AstroCam) packImagesForArea(area string) (string, error) {
 	if len(fileGroup.FilesToArchive) == 0 {
 		return EMPTY, nil
 	}
+	
+	// Wait for files to complete writing (just in case)
+	fmt.Printf("Found %d files for area %s, waiting 5 seconds for writes to complete...\n", 
+		len(fileGroup.FilesToArchive), area)
+	time.Sleep(5 * time.Second)
 
 	// Create archive filename: YYYY-MM-DD_[PREFIX]AREA_HHMMSS[POSTFIX].ext
 	now := time.Now()

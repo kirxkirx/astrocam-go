@@ -46,7 +46,7 @@ It's a complete rewrite of the original Python astrocam code in Go, with improve
 ./astrocam-go
 
 # Windows
-astrocam-go-64bit.exe
+astrocam-go-win64.exe
 ```
 
 ### **Test Mode (CI/Testing)**
@@ -55,7 +55,7 @@ astrocam-go-64bit.exe
 ./astrocam-go -test
 
 # Windows  
-astrocam-go-64bit.exe -test
+astrocam-go-win64.exe -test
 ```
 
 ### **Test Mode Behavior**
@@ -93,10 +93,10 @@ SAI_POSTFIX=_STL-11000M
 go build -o astrocam-go astrocam.go
 
 # Windows 64-bit
-GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o astrocam-win64.exe astrocam.go
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o astrocam-go-win64.exe astrocam.go
 
 # Windows 32-bit  
-GOOS=windows GOARCH=386 go build -ldflags="-s -w" -o astrocam-win32.exe astrocam.go
+GOOS=windows GOARCH=386 go build -ldflags="-s -w" -o astrocam-go-win32.exe astrocam.go
 ```
 
 ## Archive Formats
@@ -159,7 +159,7 @@ Successfully uploaded: 2025-06-29_064_111448_STL-11000M.rar
 ### **Linux Deployment**
 ```bash
 # Copy files
-cp astrocam /opt/astrocam/
+cp astrocam-go /opt/astrocam/
 cp config.env /opt/astrocam/
 cp areas.txt /opt/astrocam/
 
@@ -173,7 +173,7 @@ cd /opt/astrocam && ./astrocam-go
 ### **Windows Deployment**
 ```batch
 REM Copy files to C:\AstroCam\
-copy astrocam-win64.exe C:\AstroCam\astrocam.exe
+copy astrocam-go-win64.exe C:\AstroCam\astrocam.exe
 copy config.env C:\AstroCam\
 copy areas.txt C:\AstroCam\
 

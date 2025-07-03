@@ -29,22 +29,22 @@ jobs:
 
       - name: Build Linux binary
         run: |
-          go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-linux-amd64 astrocam.go
-          chmod +x astrocam-linux-amd64
+          go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-go astrocam.go
+          chmod +x astrocam-go
 
       - name: Build Windows 64-bit binary
         run: |
-          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-windows-amd64.exe astrocam.go
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-go-win64.exe astrocam.go
 
       - name: Build Windows 32-bit binary
         run: |
-          GOOS=windows GOARCH=386 go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-windows-386.exe astrocam.go
+          GOOS=windows GOARCH=386 go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-go-win32.exe astrocam.go
 
       - name: Create checksums
         run: |
-          sha256sum astrocam-linux-amd64 > checksums.txt
-          sha256sum astrocam-windows-amd64.exe >> checksums.txt
-          sha256sum astrocam-windows-386.exe >> checksums.txt
+          sha256sum astrocam-go > checksums.txt
+          sha256sum astrocam-go-win64.exe >> checksums.txt
+          sha256sum astrocam-go-win32.exe >> checksums.txt
           echo "Generated checksums:"
           cat checksums.txt
 
@@ -54,9 +54,9 @@ jobs:
           mkdir -p astrocam-${{ steps.version.outputs.version }}
           
           # Copy binaries
-          cp astrocam-linux-amd64 astrocam-${{ steps.version.outputs.version }}/
-          cp astrocam-windows-amd64.exe astrocam-${{ steps.version.outputs.version }}/
-          cp astrocam-windows-386.exe astrocam-${{ steps.version.outputs.version }}/
+          cp astrocam-go astrocam-${{ steps.version.outputs.version }}/
+          cp astrocam-go-win64.exe astrocam-${{ steps.version.outputs.version }}/
+          cp astrocam-go-win32.exe astrocam-${{ steps.version.outputs.version }}/
           
           # Copy configuration and documentation
           cp config.env.example astrocam-${{ steps.version.outputs.version }}/
@@ -75,7 +75,7 @@ jobs:
           
           # Copy files with verbose output
           echo "Copying executable..."
-          sudo cp -v astrocam-linux-amd64 /opt/astrocam/astrocam
+          sudo cp -v astrocam-go /opt/astrocam/astrocam
           sudo chmod +x /opt/astrocam/astrocam
           
           echo "Copying configuration files..."
@@ -112,7 +112,7 @@ jobs:
           
           REM Copy files
           echo Copying files...
-          copy /v astrocam-windows-amd64.exe "C:\AstroCam\astrocam.exe"
+          copy /v astrocam-go-win64.exe "C:\AstroCam\astrocam.exe"
           copy /v config.env.example "C:\AstroCam\config.env"
           copy /v areas.txt "C:\AstroCam\"
           copy /v README.md "C:\AstroCam\" 2>nul
@@ -172,9 +172,9 @@ jobs:
           ## 📦 Download Options
           
           ### Individual Binaries
-          - **Linux (64-bit)**: \`astrocam-linux-amd64\`
-          - **Windows (64-bit)**: \`astrocam-windows-amd64.exe\` (recommended for modern Windows)
-          - **Windows (32-bit)**: \`astrocam-windows-386.exe\` (for legacy Windows systems)
+          - **Linux (64-bit)**: \`astrocam-go\`
+          - **Windows (64-bit)**: \`astrocam-go-win64.exe\` (recommended for modern Windows)
+          - **Windows (32-bit)**: \`astrocam-go-win32.exe\` (for legacy Windows systems)
           
           ### Complete Packages (Recommended)
           - **All platforms**: \`astrocam-${{ steps.version.outputs.version }}-complete.tar.gz\` or \`astrocam-${{ steps.version.outputs.version }}-complete.zip\`
@@ -192,9 +192,9 @@ jobs:
           ./install-linux.sh
           
           # Option 2: Individual binary
-          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/astrocam-linux-amd64
-          chmod +x astrocam-linux-amd64
-          ./astrocam-linux-amd64 -version
+          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/astrocam-go
+          chmod +x astrocam-go
+          ./astrocam-go -version
           \`\`\`
           
           ### Windows Installation
@@ -215,7 +215,7 @@ jobs:
           1. Copy \`config.env.example\` to \`config.env\`
           2. Edit server URL, credentials, and directories
           3. Ensure \`areas.txt\` contains your sky field prefixes
-          4. Test with: \`./astrocam -test\`
+          4. Test with: \`./astrocam-go -test\`
           
           ### Example Configuration
           \`\`\`bash
@@ -254,13 +254,13 @@ jobs:
           ### Test Your Installation
           \`\`\`bash
           # Quick test (exits after 2 minutes if no files)
-          ./astrocam -test
+          ./astrocam-go -test
           
           # Show version
-          ./astrocam -version
+          ./astrocam-go -version
           
           # Normal operation
-          ./astrocam
+          ./astrocam-go
           \`\`\`
           
           ## 🔄 Migration from Python Version
@@ -269,7 +269,7 @@ jobs:
           2. **Backup** your current \`config.env\` and \`areas.txt\`
           3. **Install** Go version using complete package
           4. **Copy** your config files to installation directory
-          5. **Test** with \`./astrocam -test\`
+          5. **Test** with \`./astrocam-go -test\`
           6. **Deploy** and remove Python version
           
           The Go version is a **drop-in replacement** with improved reliability and performance.
@@ -314,8 +314,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./astrocam-linux-amd64
-          asset_name: astrocam-linux-amd64
+          asset_path: ./astrocam-go
+          asset_name: astrocam-go
           asset_content_type: application/octet-stream
 
       - name: Upload Windows 64-bit binary
@@ -324,8 +324,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./astrocam-windows-amd64.exe
-          asset_name: astrocam-windows-amd64.exe
+          asset_path: ./astrocam-go-win64.exe
+          asset_name: astrocam-go-win64.exe
           asset_content_type: application/octet-stream
 
       - name: Upload Windows 32-bit binary
@@ -334,8 +334,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./astrocam-windows-386.exe
-          asset_name: astrocam-windows-386.exe
+          asset_path: ./astrocam-go-win32.exe
+          asset_name: astrocam-go-win32.exe
           asset_content_type: application/octet-stream
 
       - name: Upload checksums

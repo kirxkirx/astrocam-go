@@ -1,8 +1,7 @@
 # Compiled binaries
-astrocam
-astrocam.exe
-astrocam-win64.exe
-astrocam-win32.exe
+astrocam-go
+astrocam-go-win64.exe
+astrocam-go-win32.exe
 *.exe
 
 # Configuration files with sensitive data
