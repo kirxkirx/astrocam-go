@@ -27,6 +27,11 @@ import (
 const (
 	ERROR = "ERROR"
 	EMPTY = "EMPTY"
+	
+	// Interval configuration constants
+	MIN_INTERVAL     = 15     // Minimum allowed interval in seconds
+	DEFAULT_INTERVAL = 15     // Default interval if not specified/invalid
+	MAX_INTERVAL     = 86400  // Maximum allowed interval in seconds (24 hours)
 )
 
 type Config struct {
@@ -36,6 +41,7 @@ type Config struct {
 	CameraDirectory    string
 	ProcessedDirectory string
 	Interval           int
+	RequestedInterval  int    // Store the original requested interval
 	Count              int
 	Prefix             string
 	Postfix            string
@@ -85,9 +91,10 @@ func findConfigFile(filename string) (string, error) {
 
 func loadConfig() *Config {
 	config := &Config{
-		Interval:    180,    // default
-		Count:       3,      // default
-		ArchiveMode: "auto", // default
+		Interval:          DEFAULT_INTERVAL,    // Use default instead of hardcoded 180
+		RequestedInterval: DEFAULT_INTERVAL,    // Initialize both to default
+		Count:             3,                   // default
+		ArchiveMode:       "auto",             // default
 	}
 
 	// Look for config.env in executable directory first, then current directory
@@ -131,7 +138,25 @@ func loadConfig() *Config {
 		case "SAI_PROCESSED_DIRECTORY":
 			config.ProcessedDirectory = value
 		case "SAI_INTERVAL":
-			if val, err := strconv.Atoi(value); err == nil {
+			// Handle interval with validation and fallback
+			if value == "" {
+				// Empty value - use default
+				config.RequestedInterval = DEFAULT_INTERVAL
+				config.Interval = DEFAULT_INTERVAL
+			} else if val, err := strconv.Atoi(value); err != nil {
+				// Invalid value - use default
+				fmt.Printf("Warning: Invalid SAI_INTERVAL '%s', using default %d seconds\n", value, DEFAULT_INTERVAL)
+				config.RequestedInterval = DEFAULT_INTERVAL
+				config.Interval = DEFAULT_INTERVAL
+			} else if val > MAX_INTERVAL {
+				// Too large - use default
+				fmt.Printf("Warning: SAI_INTERVAL %d exceeds maximum %d seconds, using default %d seconds\n", 
+					val, MAX_INTERVAL, DEFAULT_INTERVAL)
+				config.RequestedInterval = val  // Store what was requested
+				config.Interval = DEFAULT_INTERVAL
+			} else {
+				// Valid value - store it (will be enforced to minimum later)
+				config.RequestedInterval = val
 				config.Interval = val
 			}
 		case "SAI_COUNT":
@@ -943,7 +968,21 @@ func (ac *AstroCam) run() {
 	fmt.Println("========================================")
 	
 	fmt.Printf("Configuration:\n")
-	fmt.Printf("  Scan interval: %d seconds\n", ac.config.Interval)
+	
+	// Determine actual interval with minimum enforcement
+	actualInterval := ac.config.Interval
+	if actualInterval < MIN_INTERVAL {
+		actualInterval = MIN_INTERVAL
+	}
+	
+	// Display interval information
+	if ac.config.RequestedInterval != actualInterval {
+		fmt.Printf("  Scan interval: %d seconds (requested: %d, minimum: %d, using: %d)\n", 
+			actualInterval, ac.config.RequestedInterval, MIN_INTERVAL, actualInterval)
+	} else {
+		fmt.Printf("  Scan interval: %d seconds (minimum: %d)\n", actualInterval, MIN_INTERVAL)
+	}
+	
 	fmt.Printf("  Files per archive: %d\n", ac.config.Count)
 	fmt.Printf("  Camera directory: %s\n", ac.config.CameraDirectory)
 	fmt.Printf("  Processed directory: %s\n", ac.config.ProcessedDirectory)
@@ -971,13 +1010,8 @@ func (ac *AstroCam) run() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Ensure minimum interval (matching Python MIN_INTERVAL = 15)
-	interval := ac.config.Interval
-	if interval < 15 {
-		interval = 15
-	}
-
-	ticker := time.NewTicker(time.Duration(interval) * time.Second)
+	// Use the actual interval (with minimum enforcement)
+	ticker := time.NewTicker(time.Duration(actualInterval) * time.Second)
 	defer ticker.Stop()
 
 	// Run once immediately
