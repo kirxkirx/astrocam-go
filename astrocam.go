@@ -60,6 +60,7 @@ type AstroCam struct {
 	rarPath        string // Path to rar executable (if found)
 	testMode       bool   // Whether running in test mode
 	testStartTime  time.Time
+	fitsExt        string // Determined FITS file extension (.fts, .fits, or .fit)
 }
 
 type FileGroup struct {
@@ -126,6 +127,12 @@ func loadConfig() *Config {
 		}
 
 		key, value := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		
+		// Remove inline comments (everything after # character)
+		if commentPos := strings.Index(value, "#"); commentPos != -1 {
+			value = strings.TrimSpace(value[:commentPos])
+		}
+		
 		switch key {
 		case "SAI_SERVER":
 			config.Server = value
@@ -228,6 +235,29 @@ func findRARExecutable() (string, bool) {
 	return "", false
 }
 
+// determineFitsExtension determines which FITS file extension to use
+// by checking for existing files in the camera directory.
+// Matches shell script logic: try fts, fits, fit in order, default to fts
+func (ac *AstroCam) determineFitsExtension() string {
+	possibleExtensions := []string{"fts", "fits", "fit"}
+	
+	fmt.Printf("Determining FITS extension in: %s\n", ac.config.CameraDirectory)
+	
+	for _, ext := range possibleExtensions {
+		pattern := filepath.Join(ac.config.CameraDirectory, "*."+ext)
+		matches, err := filepath.Glob(pattern)
+		if err == nil && len(matches) > 0 {
+			fmt.Printf("FITS file extension detected: .%s (found %d files)\n", ext, len(matches))
+			return "." + ext
+		}
+		fmt.Printf("No .%s files found\n", ext)
+	}
+	
+	// Default to .fts if no files found with any extension
+	fmt.Printf("FITS file extension: .fts (default, no existing files found)\n")
+	return ".fts"
+}
+
 // determineArchiveSettings determines archive format based on config and availability
 func determineArchiveSettings(config *Config) (useRAR bool, zipCompressed bool, archiveExt string, rarPath string) {
 	rarPath, rarAvailable := findRARExecutable()
@@ -328,7 +358,7 @@ func NewAstroCam(testMode bool) (*AstroCam, error) {
 
 	currentDir, _ := os.Getwd()
 
-	return &AstroCam{
+	ac := &AstroCam{
 		config:        config,
 		areas:         areas,
 		tempDirectory: tempDir,
@@ -340,7 +370,12 @@ func NewAstroCam(testMode bool) (*AstroCam, error) {
 		rarPath:       rarPath,
 		testMode:      testMode,
 		testStartTime: time.Now(),
-	}, nil
+	}
+
+	// Determine FITS file extension after creating the struct
+	ac.fitsExt = ac.determineFitsExtension()
+
+	return ac, nil
 }
 
 // fileBrowser matches Python _filebrowser method  
@@ -374,11 +409,14 @@ func sortByNamePart(inputFileName string) string {
 	if pos == -1 {
 		return filename
 	}
-	// Return everything after first underscore, removing last 4 chars (.fts)
-	if len(filename) >= 4 {
-		return filename[pos+1 : len(filename)-4]
+	// Return everything after first underscore, removing last 4 chars (extension)
+	// Now we need to handle variable extension lengths (.fts=4, .fits=5, .fit=4)
+	// Find the last dot and remove from there
+	lastDot := strings.LastIndex(filename, ".")
+	if lastDot == -1 {
+		return filename[pos+1:]
 	}
-	return filename[pos+1:]
+	return filename[pos+1 : lastDot]
 }
 
 // sortByArchiveName matches Python _sortByArchiveName method  
@@ -435,7 +473,8 @@ func (ac *AstroCam) getArchiveFiles() ([]string, error) {
 
 // getImageFiles matches Python _getImageFiles method
 func (ac *AstroCam) getImageFiles(area string) (*FileGroup, error) {
-	files, err := ac.fileBrowser(area, ac.config.CameraDirectory, ".fts")
+	// Use the determined FITS extension instead of hardcoded ".fts"
+	files, err := ac.fileBrowser(area, ac.config.CameraDirectory, ac.fitsExt)
 	if err != nil {
 		return nil, err
 	}
@@ -914,10 +953,15 @@ func (ac *AstroCam) makeJobForAreas() {
 	hasNewFiles := false
 	
 	for _, area := range ac.areas {
-		// Check if area has files without processing them
-		files, err := ac.fileBrowser(area, ac.config.CameraDirectory, ".fts")
+		// Check if area has files without processing them - use determined extension
+		files, err := ac.fileBrowser(area, ac.config.CameraDirectory, ac.fitsExt)
 		if err != nil {
 			continue
+		}
+		
+		// Debug output to help troubleshooting
+		if len(files) > 0 {
+			fmt.Printf("DEBUG: Area '%s' has %d files (need %d)\n", area, len(files), ac.config.Count)
 		}
 		
 		if len(files) >= ac.config.Count {
@@ -998,6 +1042,7 @@ func (ac *AstroCam) run() {
 		archiveFormatDesc = "ZIP uncompressed"
 	}
 	fmt.Printf("  Archive format: %s\n", archiveFormatDesc)
+	fmt.Printf("  FITS file extension: %s\n", ac.fitsExt)
 	
 	if ac.hasCredentials() {
 		fmt.Printf("  Authentication: Enabled (username: %s)\n", ac.config.Username)
