@@ -961,7 +961,7 @@ func (ac *AstroCam) makeJobForAreas() {
 		
 		// Debug output to help troubleshooting
 		if len(files) > 0 {
-			fmt.Printf("DEBUG: Area '%s' has %d files (need %d)\n", area, len(files), ac.config.Count)
+			fmt.Printf("INFO: Area '%s' has %d files (need %d)\n", area, len(files), ac.config.Count)
 		}
 		
 		if len(files) >= ac.config.Count {
