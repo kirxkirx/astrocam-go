@@ -21,7 +21,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
 // Constants matching Python version
@@ -33,13 +32,6 @@ const (
 	MIN_INTERVAL     = 15     // Minimum allowed interval in seconds
 	DEFAULT_INTERVAL = 15     // Default interval if not specified/invalid
 	MAX_INTERVAL     = 86400  // Maximum allowed interval in seconds (24 hours)
-)
-
-// Windows console mode constants
-const (
-	STD_INPUT_HANDLE       = ^uintptr(10) + 1 // -10 as uintptr
-	ENABLE_QUICK_EDIT_MODE = 0x0040
-	ENABLE_EXTENDED_FLAGS  = 0x0080
 )
 
 type Config struct {
@@ -74,78 +66,6 @@ type AstroCam struct {
 type FileGroup struct {
 	FilesToArchive []string
 	FilesToDelete  []string
-}
-
-// disableQuickEditMode disables Windows console QuickEdit mode to prevent
-// program freezing when text is selected in the console window.
-// This function is safe to call on any platform and will gracefully handle
-// errors if called in non-standard console environments.
-func disableQuickEditMode() {
-	// Only attempt on Windows
-	if runtime.GOOS != "windows" {
-		return
-	}
-	
-	// Try to load kernel32.dll - will fail gracefully on non-Windows or if DLL unavailable
-	kernel32, err := syscall.LoadDLL("kernel32.dll")
-	if err != nil {
-		// Not a fatal error - might be running in non-standard environment
-		return
-	}
-	defer kernel32.Release()
-	
-	// Get required procedures
-	getStdHandle, err := kernel32.FindProc("GetStdHandle")
-	if err != nil {
-		return
-	}
-	
-	getConsoleMode, err := kernel32.FindProc("GetConsoleMode")
-	if err != nil {
-		return
-	}
-	
-	setConsoleMode, err := kernel32.FindProc("SetConsoleMode")
-	if err != nil {
-		return
-	}
-	
-	// Get handle to console input
-	handle, _, err := getStdHandle.Call(STD_INPUT_HANDLE)
-	if handle == 0 || handle == uintptr(syscall.InvalidHandle) {
-		// Not running in a console window - this is fine
-		return
-	}
-	
-	// Get current console mode
-	var mode uint32
-	ret, _, err := getConsoleMode.Call(handle, uintptr(unsafe.Pointer(&mode)))
-	if ret == 0 {
-		// Could not get console mode - might not be a real console
-		// This can happen in Windows Terminal, Git Bash, etc.
-		return
-	}
-	
-	// Check if QuickEdit is actually enabled
-	if (mode & ENABLE_QUICK_EDIT_MODE) == 0 {
-		// QuickEdit already disabled, nothing to do
-		return
-	}
-	
-	// Disable QuickEdit mode
-	newMode := mode &^ ENABLE_QUICK_EDIT_MODE
-	newMode |= ENABLE_EXTENDED_FLAGS
-	
-	ret, _, err = setConsoleMode.Call(handle, uintptr(newMode))
-	if ret == 0 {
-		// Failed to set mode - log but continue
-		fmt.Printf("Note: Could not disable Windows QuickEdit mode: %v\n", err)
-		fmt.Printf("If program freezes when text is selected, disable QuickEdit in console properties.\n")
-		return
-	}
-	
-	// Success
-	fmt.Println("Windows QuickEdit mode disabled (text selection will not freeze the program)")
 }
 
 // findConfigFile looks for a config file in multiple locations:
@@ -489,8 +409,7 @@ func sortByNamePart(inputFileName string) string {
 	if pos == -1 {
 		return filename
 	}
-	// Return everything after first underscore, removing last 4 chars (extension)
-	// Now we need to handle variable extension lengths (.fts=4, .fits=5, .fit=4)
+	// Return everything after first underscore, removing extension
 	// Find the last dot and remove from there
 	lastDot := strings.LastIndex(filename, ".")
 	if lastDot == -1 {
@@ -1159,6 +1078,7 @@ var version string
 
 func main() {
 	// Disable Windows QuickEdit mode first thing to prevent console freezing
+	// This function is implemented in platform-specific files (quickedit_*.go)
 	disableQuickEditMode()
 	
 	// Define all flags consistently using flag package
