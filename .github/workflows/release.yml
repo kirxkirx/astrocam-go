@@ -29,16 +29,16 @@ jobs:
 
       - name: Build Linux binary
         run: |
-          go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-go astrocam.go
+          go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-go
           chmod +x astrocam-go
 
       - name: Build Windows 64-bit binary
         run: |
-          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-go-win64.exe astrocam.go
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-go-win64.exe
 
       - name: Build Windows 32-bit binary
         run: |
-          GOOS=windows GOARCH=386 go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-go-win32.exe astrocam.go
+          GOOS=windows GOARCH=386 go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-go-win32.exe
 
       - name: Create checksums
         run: |
@@ -132,6 +132,9 @@ jobs:
           echo Config files are automatically found next to the executable!
           echo No need to copy config files to working directory.
           echo.
+          echo IMPORTANT: Windows QuickEdit mode is automatically disabled
+          echo to prevent program freezing when text is selected in console.
+          echo.
           pause
           EOF
           
@@ -153,6 +156,12 @@ jobs:
           - **Smart Config Lookup**: Automatically finds config files next to executable, then falls back to current directory
           - **Flexible Deployment**: No need to copy config files to working directory
           - **Cross-Platform Paths**: Handles Windows/Linux path differences automatically
+          
+          ### ✅ **Windows Console Stability**
+          - **QuickEdit Mode Protection**: Automatically disables Windows QuickEdit mode on startup
+          - **No More Freezing**: Program won't freeze when text is selected in console
+          - **Smart Detection**: Gracefully handles Windows Terminal, Git Bash, and other non-standard consoles
+          - **Cross-Platform Safe**: Unix/Linux systems unaffected (function is no-op)
           
           ### ✅ **Automatic Archive Format Detection**
           - **RAR Format**: Uses external \`rar\` command when available (better compression)
@@ -203,6 +212,8 @@ jobs:
           3. Run \`install-windows.bat\` as Administrator
           4. Edit \`C:\\AstroCam\\config.env\` with your settings
           5. Run \`C:\\AstroCam\\astrocam.exe -test\` to verify
+          
+          **Windows Note**: QuickEdit mode is automatically disabled on startup to prevent console freezing!
           
           ## ⚙️ Configuration
           
@@ -263,6 +274,13 @@ jobs:
           ./astrocam-go
           \`\`\`
           
+          ### Windows Console Notes
+          On Windows, you'll see:
+          \`\`\`
+          Windows QuickEdit mode disabled (text selection will not freeze the program)
+          \`\`\`
+          This is normal and ensures stable operation. The program automatically disables QuickEdit mode to prevent freezing when text is selected.
+          
           ## 🔄 Migration from Python Version
           
           1. **Stop** the Python astrocam service
@@ -281,6 +299,7 @@ jobs:
           - **HTTP 401/403 errors**: Check username/password in config.env
           - **File move errors**: System retries automatically, then continues
           - **Test timeout**: Normal behavior when no files present in test mode
+          - **Windows console freezing**: Fixed automatically - program disables QuickEdit mode on startup
           
           ### Getting Help
           - Check the complete README.md in the package

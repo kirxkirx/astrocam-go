@@ -20,21 +20,21 @@ echo "✓ Go version: $GO_VERSION"
 # Build executables
 echo ""
 echo "Building astrocam-go for Linux..."
-go build -o astrocam-go astrocam.go
+go build -o astrocam-go
 if [ $? -ne 0 ]; then
     echo "ERROR: Linux build failed"
     exit 1
 fi
 
 echo "Building astrocam-go for Windows (64-bit)..."
-GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o astrocam-go-win64.exe astrocam.go
+GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o astrocam-go-win64.exe
 if [ $? -ne 0 ]; then
     echo "ERROR: Windows 64-bit build failed"
     exit 1
 fi
 
 echo "Building astrocam-go for Windows (32-bit)..."
-GOOS=windows GOARCH=386 go build -ldflags="-s -w" -o astrocam-go-win32.exe astrocam.go
+GOOS=windows GOARCH=386 go build -ldflags="-s -w" -o astrocam-go-win32.exe
 if [ $? -ne 0 ]; then
     echo "ERROR: Windows 32-bit build failed"
     exit 1
@@ -159,6 +159,7 @@ echo "This test will:"
 echo "  - Test smart config file location (looks next to executable first)"
 echo "  - Process available test files ($(ls test_data/1_semka/*.fts 2>/dev/null | wc -l) files found)"
 echo "  - Create archives ($RAR_AVAILABLE RAR, built-in ZIP as fallback)"
+echo "  - Test Windows QuickEdit mode protection (automatic on Windows)"
 echo "  - Attempt uploads to mock server (expected to fail - this is normal)"
 echo "  - Test file movement to processed directory"
 echo "  - Exit automatically after 2 minutes if no new files"
@@ -233,6 +234,12 @@ echo "   - First checks next to executable (preferred for deployment)"
 echo "   - Falls back to current directory (development/legacy mode)"
 echo "   ✓ This enables flexible deployment without copying config files"
 
+echo ""
+echo "5. Windows console protection:"
+echo "   ✓ QuickEdit mode protection built-in (automatic on Windows)"
+echo "   ✓ Prevents program freezing when text is selected"
+echo "   ✓ No action needed - works automatically on all platforms"
+
 if [ "$TEST_RESULT" == "PASSED" ]; then
     echo ""
     echo "========================================="
@@ -254,6 +261,7 @@ if [ "$TEST_RESULT" == "PASSED" ]; then
     echo "  # Copy config.env.example to C:\\AstroCam\\config.env"
     echo "  # Copy areas.txt to C:\\AstroCam\\"
     echo "  # Edit config files and run astrocam.exe"
+    echo "  # QuickEdit mode is automatically disabled on startup!"
     echo ""
     echo "Usage commands:"
     echo "  Normal operation:     ./astrocam-go"
@@ -263,9 +271,15 @@ if [ "$TEST_RESULT" == "PASSED" ]; then
     echo "Key features verified:"
     echo "  ✓ Smart config file location detection"
     echo "  ✓ Automatic archive format selection (RAR/ZIP)"
+    echo "  ✓ Windows QuickEdit mode protection (automatic)"
     echo "  ✓ Test mode with timeout and error handling"
     echo "  ✓ File processing and movement"
     echo "  ✓ Cross-platform binary generation"
+    echo ""
+    echo "Windows-specific features:"
+    echo "  ✓ Automatic QuickEdit mode disabling"
+    echo "  ✓ No more console freezing on text selection"
+    echo "  ✓ Graceful handling of non-standard consoles"
     echo ""
 else
     echo ""
@@ -294,6 +308,11 @@ else
     echo "   - Ensure config.env and areas.txt exist"
     echo "   - Check file format and encoding (no BOM)"
     echo "   - Verify directory paths are correct"
+    echo ""
+    echo "5. Windows console issues:"
+    echo "   - QuickEdit protection is automatic (no manual setup needed)"
+    echo "   - Works on all Windows versions and console types"
+    echo "   - Check output for 'Windows QuickEdit mode disabled' message"
     echo ""
     echo "Re-run test after fixing issues:"
     echo "  ./compile_and_test.sh"

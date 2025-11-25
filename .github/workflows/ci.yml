@@ -77,7 +77,7 @@ jobs:
 
       - name: Build Linux version
         run: |
-          go build -o astrocam-go astrocam.go
+          go build -o astrocam-go
           echo "✓ Linux build successful"
           ./astrocam-go -version || echo "Version info:"
 
@@ -85,8 +85,8 @@ jobs:
         run: |
           # Cross-compile Windows binaries from Linux (not executed here)
           # Actual Windows testing happens in the test-windows job
-          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o astrocam-go-win64.exe astrocam.go
-          GOOS=windows GOARCH=386 go build -ldflags="-s -w" -o astrocam-go-win32.exe astrocam.go
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o astrocam-go-win64.exe
+          GOOS=windows GOARCH=386 go build -ldflags="-s -w" -o astrocam-go-win32.exe
           echo "✓ Windows builds successful"
           ls -lh astrocam*
 
@@ -287,7 +287,7 @@ jobs:
         shell: pwsh
         run: |
           # When running on Windows, go build naturally produces a Windows .exe
-          go build -ldflags="-s -w" -o astrocam-go-win64.exe astrocam.go
+          go build -ldflags="-s -w" -o astrocam-go-win64.exe
           Write-Host "✓ Windows build successful"
           Get-ChildItem astrocam-go-win64.exe
           .\astrocam-go-win64.exe -version
@@ -501,7 +501,7 @@ jobs:
 
       - name: Build and run Linux integration test
         run: |
-          go build -o astrocam-go astrocam.go
+          go build -o astrocam-go
           echo "Running Linux integration test with real server..."
           echo "Testing config file location detection and real upload..."
           ./astrocam-go -test
@@ -578,7 +578,7 @@ jobs:
         shell: pwsh
         run: |
           # Build Windows binary natively
-          go build -ldflags="-s -w" -o astrocam-go-win64.exe astrocam.go
+          go build -ldflags="-s -w" -o astrocam-go-win64.exe
           Write-Host "Running Windows integration test with real server..."
           Write-Host "Testing config file location detection and real upload..."
           .\astrocam-go-win64.exe -test
