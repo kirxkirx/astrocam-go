@@ -58,9 +58,10 @@ type AstroCam struct {
 	archiveExt     string // ".rar" or ".zip"
 	zipCompressed  bool   // Whether to compress ZIP files
 	rarPath        string // Path to rar executable (if found)
-	testMode       bool   // Whether running in test mode
-	testStartTime  time.Time
-	fitsExt        string // Determined FITS file extension (.fts, .fits, or .fit)
+	testMode              bool      // Whether running in test mode
+	testStartTime         time.Time
+	fitsExt               string    // Determined FITS file extension (.fts, .fits, or .fit)
+	diskSpaceWaitUntil    time.Time // Skip uploads until this time after disk space error
 }
 
 type FileGroup struct {
@@ -726,6 +727,46 @@ func (ac *AstroCam) waitForUploadThrottle() {
 	}
 }
 
+// checkServerDiskSpace sends a GET preflight request to check server disk space.
+// Returns status ("ok", "warning", "error", "unknown") and a message string.
+func (ac *AstroCam) checkServerDiskSpace() (string, string) {
+	req, err := http.NewRequest("GET", ac.config.Server, nil)
+	if err != nil {
+		return "unknown", fmt.Sprintf("failed to create request: %v", err)
+	}
+
+	if ac.hasCredentials() {
+		req.SetBasicAuth(ac.config.Username, ac.config.Password)
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "unknown", fmt.Sprintf("preflight request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	body := string(bodyBytes)
+
+	if strings.Contains(body, "UNMW_STATUS:ERROR") {
+		return "error", body
+	}
+	if strings.Contains(body, "UNMW_STATUS:WARNING") {
+		return "warning", body
+	}
+	if strings.Contains(body, "UNMW_STATUS:OK") {
+		return "ok", ""
+	}
+
+	// No UNMW_STATUS marker — old server or unexpected response
+	if resp.StatusCode == 507 {
+		return "error", fmt.Sprintf("server returned 507: %s", body)
+	}
+
+	return "unknown", ""
+}
+
 // packImagesForArea matches Python packImagesForArea method
 func (ac *AstroCam) packImagesForArea(area string) (string, error) {
 	originalDir, _ := os.Getwd()
@@ -877,10 +918,22 @@ func (ac *AstroCam) uploadFile(filePath string) error {
 	}
 	defer resp.Body.Close()
 
+	// Read response body to detect disk space warnings/errors
+	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	bodyStr := string(bodyBytes)
+
 	// Check response
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if strings.Contains(bodyStr, "UNMW_STATUS:WARNING") {
+			fmt.Printf("WARNING from server: %s\n", strings.TrimSpace(bodyStr))
+		}
 		fmt.Printf("Successfully uploaded: %s\n", filepath.Base(filePath))
 		return nil
+	}
+
+	// Specific handling for 507 Insufficient Storage
+	if resp.StatusCode == 507 {
+		return fmt.Errorf("server out of disk space (status 507): %s", strings.TrimSpace(bodyStr))
 	}
 
 	uploadErr := fmt.Errorf("server returned status %d: %s", resp.StatusCode, resp.Status)
@@ -900,10 +953,57 @@ func (ac *AstroCam) deleteFile(filePath string) error {
 	return nil
 }
 
+// setDiskSpaceWait records that the server is out of disk space.
+// In test mode, exits immediately. In normal mode, sets a 1-hour wait.
+func (ac *AstroCam) setDiskSpaceWait(msg string) {
+	if ac.testMode {
+		fmt.Printf("FATAL ERROR (Test Mode): server out of disk space\n")
+		os.Exit(1)
+	}
+	ac.diskSpaceWaitUntil = time.Now().Add(1 * time.Hour)
+	fmt.Printf("Server out of disk space. Will retry uploads after %s\n",
+		ac.diskSpaceWaitUntil.Format("15:04:05"))
+}
+
+// isDiskSpaceWait returns true if we're still waiting after a disk space error.
+func (ac *AstroCam) isDiskSpaceWait() bool {
+	if ac.diskSpaceWaitUntil.IsZero() {
+		return false
+	}
+	if time.Now().After(ac.diskSpaceWaitUntil) {
+		ac.diskSpaceWaitUntil = time.Time{} // Reset
+		return false
+	}
+	return true
+}
+
 // makeJobForArchive matches Python makeJobForArchive function
 func (ac *AstroCam) makeJobForArchive(archiveFile string) {
+	// Skip if we're in a disk-space wait period
+	if ac.isDiskSpaceWait() {
+		return
+	}
+
+	// Preflight check: query server disk space before uploading
+	status, msg := ac.checkServerDiskSpace()
+	switch status {
+	case "error":
+		fmt.Printf("Server disk space error: %s\n", msg)
+		ac.setDiskSpaceWait(msg)
+		return // Archive stays in temp/ for retry
+	case "warning":
+		fmt.Printf("Server disk space warning: %s\n", msg)
+		// Proceed with upload despite warning
+	case "unknown":
+		// Old server or network issue — proceed with upload normally
+	}
+
 	if err := ac.uploadFile(archiveFile); err != nil {
 		fmt.Printf("Upload error: %v\n", err)
+		// If it was a 507 disk space error, set wait period
+		if strings.Contains(err.Error(), "507") {
+			ac.setDiskSpaceWait(err.Error())
+		}
 		return
 	}
 
@@ -926,8 +1026,13 @@ func (ac *AstroCam) makeJobForArchives() {
 	}
 }
 
-// makeJobForArea matches Python makeJobForArea function  
+// makeJobForArea matches Python makeJobForArea function
 func (ac *AstroCam) makeJobForArea(area string) {
+	// Skip if we're in a disk-space wait period — don't pack new archives
+	if ac.isDiskSpaceWait() {
+		return
+	}
+
 	archiveFile, err := ac.packImagesForArea(area)
 	if err != nil {
 		fmt.Printf("Error processing area %s: %v\n", area, err)

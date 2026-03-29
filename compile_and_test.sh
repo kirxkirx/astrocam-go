@@ -240,6 +240,105 @@ echo "   ✓ QuickEdit mode protection built-in (automatic on Windows)"
 echo "   ✓ Prevents program freezing when text is selected"
 echo "   ✓ No action needed - works automatically on all platforms"
 
+echo ""
+echo "========================================="
+echo "TESTING DISK SPACE ERROR HANDLING"
+echo "========================================="
+echo ""
+
+# Start a mock HTTP server that simulates out-of-disk-space (507)
+MOCK_DISK_PORT=9998
+python3 -c "
+from http.server import HTTPServer, BaseHTTPRequestHandler
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(507)
+        self.send_header('Content-Type','text/plain')
+        self.end_headers()
+        self.wfile.write(b'UNMW_STATUS:ERROR server test is out of disk space, only 1000 MB free')
+    def do_POST(self):
+        # Read and discard the request body to avoid broken pipe
+        content_length = int(self.headers.get('Content-Length', 0))
+        while content_length > 0:
+            chunk = self.rfile.read(min(content_length, 65536))
+            if not chunk:
+                break
+            content_length -= len(chunk)
+        self.do_GET()
+    def log_message(self, format, *args):
+        pass
+HTTPServer(('127.0.0.1',$MOCK_DISK_PORT),H).serve_forever()
+" &
+MOCK_PID=$!
+sleep 1
+
+# Check mock server is running
+if ! kill -0 "$MOCK_PID" 2>/dev/null; then
+    echo "ERROR: Failed to start mock server for disk space test"
+else
+    # Prepare fresh test data for disk space test
+    rm -f test_data/1_semka/* test_data/2_otpravleno/* temp/* 2>/dev/null || true
+    for area in 064; do
+        for i in 1 2 3; do
+            timestamp="2025-01-0${i}_12-00-0${i}"
+            filename="${area}_${timestamp}_STL-11000M.fts"
+            echo "Mock FITS data for disk space test" > "test_data/1_semka/$filename"
+        done
+    done
+
+    # Save original config and point to mock server
+    cp config.env config.env.bak
+    cat > config.env << EOFCONFIG
+SAI_SERVER=http://127.0.0.1:$MOCK_DISK_PORT/upload.py
+SAI_USERNAME=test_user
+SAI_PASSWORD=test_pass
+SAI_CAMERA_DIRECTORY=test_data/1_semka
+SAI_PROCESSED_DIRECTORY=test_data/2_otpravleno
+SAI_INTERVAL=10
+SAI_COUNT=3
+SAI_PREFIX=CI_
+SAI_POSTFIX=_TEST
+EOFCONFIG
+
+    echo "Running astrocam-go against 507-returning mock server..."
+    DISK_TEST_OUTPUT=$(timeout 60s ./astrocam-go -test 2>&1) || true
+    DISK_TEST_EXIT=$?
+
+    # Restore original config
+    mv config.env.bak config.env
+
+    echo "$DISK_TEST_OUTPUT"
+    echo ""
+
+    # Check that the output mentions disk space error
+    if echo "$DISK_TEST_OUTPUT" | grep -qi "disk space"; then
+        echo "   ✓ Disk space error correctly detected by astrocam-go"
+        DISK_TEST_PASSED=true
+    else
+        echo "   ✗ Disk space error NOT detected — astrocam-go should report disk space issues"
+        DISK_TEST_PASSED=false
+    fi
+
+    # Check that archives are preserved (not deleted) in temp/
+    if ls temp/*.zip temp/*.rar 2>/dev/null | grep -q .; then
+        echo "   ✓ Archive preserved in temp/ (not deleted on server error)"
+    else
+        echo "   (no archive to check — may not have been created in this test)"
+    fi
+
+    kill "$MOCK_PID" 2>/dev/null
+    wait "$MOCK_PID" 2>/dev/null || true
+
+    if [ "$DISK_TEST_PASSED" != "true" ]; then
+        TEST_RESULT="FAILED"
+        echo "   ✗ Disk space error handling test FAILED"
+    else
+        echo "   ✓ Disk space error handling test PASSED"
+    fi
+fi
+
+echo ""
+
 if [ "$TEST_RESULT" == "PASSED" ]; then
     echo ""
     echo "========================================="
