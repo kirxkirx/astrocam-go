@@ -60,7 +60,7 @@ type AstroCam struct {
 	rarPath        string // Path to rar executable (if found)
 	testMode              bool      // Whether running in test mode
 	testStartTime         time.Time
-	fitsExt               string    // Determined FITS file extension (.fts, .fits, or .fit)
+	fitsExtPattern        string    // Regex pattern matching all FITS file extensions (.fts, .fits, .fit)
 	diskSpaceWaitUntil    time.Time // Skip uploads until this time after disk space error
 }
 
@@ -236,28 +236,8 @@ func findRARExecutable() (string, bool) {
 	return "", false
 }
 
-// determineFitsExtension determines which FITS file extension to use
-// by checking for existing files in the camera directory.
-// Matches shell script logic: try fts, fits, fit in order, default to fts
-func (ac *AstroCam) determineFitsExtension() string {
-	possibleExtensions := []string{"fts", "fits", "fit"}
-	
-	fmt.Printf("Determining FITS extension in: %s\n", ac.config.CameraDirectory)
-	
-	for _, ext := range possibleExtensions {
-		pattern := filepath.Join(ac.config.CameraDirectory, "*."+ext)
-		matches, err := filepath.Glob(pattern)
-		if err == nil && len(matches) > 0 {
-			fmt.Printf("FITS file extension detected: .%s (found %d files)\n", ext, len(matches))
-			return "." + ext
-		}
-		fmt.Printf("No .%s files found\n", ext)
-	}
-	
-	// Default to .fts if no files found with any extension
-	fmt.Printf("FITS file extension: .fts (default, no existing files found)\n")
-	return ".fts"
-}
+// fitsExtensionPattern returns a regex fragment matching all supported FITS file extensions.
+const fitsExtensionPattern = `\.(fts|fits|fit)`
 
 // determineArchiveSettings determines archive format based on config and availability
 func determineArchiveSettings(config *Config) (useRAR bool, zipCompressed bool, archiveExt string, rarPath string) {
@@ -373,16 +353,14 @@ func NewAstroCam(testMode bool) (*AstroCam, error) {
 		testStartTime: time.Now(),
 	}
 
-	// Determine FITS file extension after creating the struct
-	ac.fitsExt = ac.determineFitsExtension()
+	ac.fitsExtPattern = fitsExtensionPattern
 
 	return ac, nil
 }
 
 // fileBrowser matches Python _filebrowser method  
-func (ac *AstroCam) fileBrowser(constellation, dir, ext string) ([]string, error) {
-	// Fixed pattern to match Python: "(^" + constellation + "(_|-SF_).*\\" + ext + ")"
-	pattern := fmt.Sprintf("^%s(_|-SF_).*%s", constellation, regexp.QuoteMeta(ext))
+func (ac *AstroCam) fileBrowser(constellation, dir, extPattern string) ([]string, error) {
+	pattern := fmt.Sprintf("^%s(_|-SF_).*%s$", constellation, extPattern)
 	regex, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("invalid regex pattern: %w", err)
@@ -474,7 +452,7 @@ func (ac *AstroCam) getArchiveFiles() ([]string, error) {
 // getImageFiles matches Python _getImageFiles method
 func (ac *AstroCam) getImageFiles(area string) (*FileGroup, error) {
 	// Use the determined FITS extension instead of hardcoded ".fts"
-	files, err := ac.fileBrowser(area, ac.config.CameraDirectory, ac.fitsExt)
+	files, err := ac.fileBrowser(area, ac.config.CameraDirectory, ac.fitsExtPattern)
 	if err != nil {
 		return nil, err
 	}
@@ -1056,9 +1034,14 @@ func (ac *AstroCam) makeJobForArea(area string) {
 func (ac *AstroCam) makeJobForAreas() {
 	hasNewFiles := false
 	
+	if _, err := os.Stat(ac.config.CameraDirectory); os.IsNotExist(err) {
+		fmt.Printf("WARNING: Camera directory does not exist: %s\n", ac.config.CameraDirectory)
+		return
+	}
+
 	for _, area := range ac.areas {
 		// Check if area has files without processing them - use determined extension
-		files, err := ac.fileBrowser(area, ac.config.CameraDirectory, ac.fitsExt)
+		files, err := ac.fileBrowser(area, ac.config.CameraDirectory, ac.fitsExtPattern)
 		if err != nil {
 			continue
 		}
@@ -1146,7 +1129,7 @@ func (ac *AstroCam) run() {
 		archiveFormatDesc = "ZIP uncompressed"
 	}
 	fmt.Printf("  Archive format: %s\n", archiveFormatDesc)
-	fmt.Printf("  FITS file extension: %s\n", ac.fitsExt)
+	fmt.Printf("  FITS file extensions: .fts, .fits, .fit\n")
 	
 	if ac.hasCredentials() {
 		fmt.Printf("  Authentication: Enabled (username: %s)\n", ac.config.Username)
