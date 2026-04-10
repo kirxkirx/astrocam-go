@@ -1186,6 +1186,18 @@ func main() {
 		return
 	}
 
+	// Acquire a file lock to prevent multiple instances from running simultaneously.
+	// The lock file is placed next to the executable (or in the current directory as fallback).
+	lockPath := "astrocam.lock"
+	if execPath, err := os.Executable(); err == nil {
+		lockPath = filepath.Join(filepath.Dir(execPath), lockPath)
+	}
+	lock, err := acquireFileLock(lockPath)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	defer lock.release()
+
 	app, err := NewAstroCam(*testMode)
 	if err != nil {
 		log.Fatalf("Initialization failed: %v", err)
