@@ -32,6 +32,10 @@ const (
 	MIN_INTERVAL     = 15     // Minimum allowed interval in seconds
 	DEFAULT_INTERVAL = 15     // Default interval if not specified/invalid
 	MAX_INTERVAL     = 86400  // Maximum allowed interval in seconds (24 hours)
+
+	// How long to pause uploads after a server-side rejection, by cause.
+	HIGH_LOAD_PAUSE  = 10 * time.Minute // server reported high system load
+	DISK_SPACE_PAUSE = 1 * time.Hour    // server reported out of disk space
 )
 
 type Config struct {
@@ -61,7 +65,7 @@ type AstroCam struct {
 	testMode              bool      // Whether running in test mode
 	testStartTime         time.Time
 	fitsExtPattern        string    // Regex pattern matching all FITS file extensions (.fts, .fits, .fit)
-	diskSpaceWaitUntil    time.Time // Skip uploads until this time after disk space error
+	uploadPauseUntil      time.Time // Skip uploads until this time after a server-side rejection (high load or out of disk space)
 }
 
 type FileGroup struct {
@@ -834,6 +838,21 @@ func (ac *AstroCam) hasCredentials() bool {
 	return ac.config.Username != "" && ac.config.Password != ""
 }
 
+// uploadResponseIndicatesSuccess reports whether a 2xx upload response body
+// actually confirms success. upload.py returns HTTP 200 even for several POST
+// failures (it only sets a non-2xx status for out-of-disk-space), so success is
+// recognized by a positive marker: the redirect page printed on success
+// ("Upload successful") or an explicit UNMW_STATUS:OK from a newer server. An
+// explicit UNMW_STATUS:ERROR always counts as failure.
+func uploadResponseIndicatesSuccess(body string) bool {
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "unmw_status:error") {
+		return false
+	}
+	return strings.Contains(lower, "upload successful") ||
+		strings.Contains(lower, "unmw_status:ok")
+}
+
 // uploadFile matches FileUploader functionality with proper resource management
 func (ac *AstroCam) uploadFile(filePath string) error {
 	// Wait for upload throttling (120 seconds between uploads)
@@ -900,13 +919,26 @@ func (ac *AstroCam) uploadFile(filePath string) error {
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	bodyStr := string(bodyBytes)
 
-	// Check response
+	// Check response.
+	//
+	// A 2xx status alone does NOT mean the upload succeeded: upload.py returns
+	// HTTP 200 with an HTML error body for several POST failures (high system
+	// load, missing upload directory, archive validation failure, processing
+	// error) -- it only sets a non-2xx status (507) for out-of-disk-space. So
+	// treat the upload as successful ONLY when the body carries a positive
+	// success marker; otherwise return an error so the caller keeps the local
+	// archive for retry instead of deleting it.
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		if strings.Contains(bodyStr, "UNMW_STATUS:WARNING") {
-			fmt.Printf("WARNING from server: %s\n", strings.TrimSpace(bodyStr))
+		if uploadResponseIndicatesSuccess(bodyStr) {
+			if strings.Contains(bodyStr, "UNMW_STATUS:WARNING") {
+				fmt.Printf("WARNING from server: %s\n", strings.TrimSpace(bodyStr))
+			}
+			fmt.Printf("Successfully uploaded: %s\n", filepath.Base(filePath))
+			return nil
 		}
-		fmt.Printf("Successfully uploaded: %s\n", filepath.Base(filePath))
-		return nil
+		// 2xx but no success marker -> the server rejected or failed the upload.
+		return fmt.Errorf("upload not confirmed by server (HTTP %d): %s",
+			resp.StatusCode, strings.TrimSpace(bodyStr))
 	}
 
 	// Specific handling for 507 Insufficient Storage
@@ -914,7 +946,9 @@ func (ac *AstroCam) uploadFile(filePath string) error {
 		return fmt.Errorf("server out of disk space (status 507): %s", strings.TrimSpace(bodyStr))
 	}
 
-	uploadErr := fmt.Errorf("server returned status %d: %s", resp.StatusCode, resp.Status)
+	// Include the response body so the caller can classify the cause (e.g. a
+	// 503 "system load too high" -> short pause) from the server's message.
+	uploadErr := fmt.Errorf("server returned status %d: %s; %s", resp.StatusCode, resp.Status, strings.TrimSpace(bodyStr))
 	if ac.testMode {
 		fmt.Printf("FATAL ERROR (Test Mode): %v\n", uploadErr)
 		os.Exit(1)
@@ -931,25 +965,67 @@ func (ac *AstroCam) deleteFile(filePath string) error {
 	return nil
 }
 
-// setDiskSpaceWait records that the server is out of disk space.
-// In test mode, exits immediately. In normal mode, sets a 1-hour wait.
-func (ac *AstroCam) setDiskSpaceWait(msg string) {
-	if ac.testMode {
-		fmt.Printf("FATAL ERROR (Test Mode): server out of disk space\n")
-		os.Exit(1)
+// formatPauseDuration renders a pause length in friendly units
+// ("10 minutes", "1 hour") for log messages.
+func formatPauseDuration(d time.Duration) string {
+	if d >= time.Hour && d%time.Hour == 0 {
+		h := int(d / time.Hour)
+		if h == 1 {
+			return "1 hour"
+		}
+		return fmt.Sprintf("%d hours", h)
 	}
-	ac.diskSpaceWaitUntil = time.Now().Add(1 * time.Hour)
-	fmt.Printf("Server out of disk space. Will retry uploads after %s\n",
-		ac.diskSpaceWaitUntil.Format("15:04:05"))
+	if d >= time.Minute && d%time.Minute == 0 {
+		m := int(d / time.Minute)
+		if m == 1 {
+			return "1 minute"
+		}
+		return fmt.Sprintf("%d minutes", m)
+	}
+	return d.String()
 }
 
-// isDiskSpaceWait returns true if we're still waiting after a disk space error.
-func (ac *AstroCam) isDiskSpaceWait() bool {
-	if ac.diskSpaceWaitUntil.IsZero() {
+// classifyServerError inspects a server UNMW_STATUS:ERROR body (or an upload
+// error string) and returns a human-readable reason and the pause duration to
+// apply: out of disk space pauses for DISK_SPACE_PAUSE, high system load for
+// HIGH_LOAD_PAUSE. Anything else is treated as a transient error and uses the
+// shorter high-load pause so we retry reasonably soon.
+func classifyServerError(body string) (string, time.Duration) {
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "out of disk space") ||
+		strings.Contains(lower, "insufficient storage") ||
+		strings.Contains(lower, "507") {
+		return "Server is out of disk space", DISK_SPACE_PAUSE
+	}
+	if strings.Contains(lower, "load too high") ||
+		strings.Contains(lower, "system load") {
+		return "Server is busy: system load too high", HIGH_LOAD_PAUSE
+	}
+	return "Server reported a temporary error", HIGH_LOAD_PAUSE
+}
+
+// pauseUploads records that uploads must be skipped until a future time and
+// prints an informative message naming the cause and how long the pause lasts.
+// In test mode, a server-side rejection is fatal (exit immediately).
+func (ac *AstroCam) pauseUploads(reason string, duration time.Duration, detail string) {
+	if ac.testMode {
+		fmt.Printf("FATAL ERROR (Test Mode): %s\n", reason)
+		os.Exit(1)
+	}
+	ac.uploadPauseUntil = time.Now().Add(duration)
+	fmt.Printf("%s. Pausing uploads for %s, will retry after %s.\nServer response: %s\n",
+		reason, formatPauseDuration(duration),
+		ac.uploadPauseUntil.Format("15:04:05"), strings.TrimSpace(detail))
+}
+
+// isUploadPaused returns true if we are still within a pause window set after a
+// server-side rejection (high load or out of disk space).
+func (ac *AstroCam) isUploadPaused() bool {
+	if ac.uploadPauseUntil.IsZero() {
 		return false
 	}
-	if time.Now().After(ac.diskSpaceWaitUntil) {
-		ac.diskSpaceWaitUntil = time.Time{} // Reset
+	if time.Now().After(ac.uploadPauseUntil) {
+		ac.uploadPauseUntil = time.Time{} // Reset
 		return false
 	}
 	return true
@@ -957,17 +1033,17 @@ func (ac *AstroCam) isDiskSpaceWait() bool {
 
 // makeJobForArchive matches Python makeJobForArchive function
 func (ac *AstroCam) makeJobForArchive(archiveFile string) {
-	// Skip if we're in a disk-space wait period
-	if ac.isDiskSpaceWait() {
+	// Skip if we're in a pause period set by an earlier server rejection
+	if ac.isUploadPaused() {
 		return
 	}
 
-	// Preflight check: query server disk space before uploading
+	// Preflight check: query server status (disk space and system load) before uploading
 	status, msg := ac.checkServerDiskSpace()
 	switch status {
 	case "error":
-		fmt.Printf("Server disk space error: %s\n", msg)
-		ac.setDiskSpaceWait(msg)
+		reason, pause := classifyServerError(msg)
+		ac.pauseUploads(reason, pause, msg)
 		return // Archive stays in temp/ for retry
 	case "warning":
 		fmt.Printf("Server disk space warning: %s\n", msg)
@@ -978,9 +1054,18 @@ func (ac *AstroCam) makeJobForArchive(archiveFile string) {
 
 	if err := ac.uploadFile(archiveFile); err != nil {
 		fmt.Printf("Upload error: %v\n", err)
-		// If it was a 507 disk space error, set wait period
-		if strings.Contains(err.Error(), "507") {
-			ac.setDiskSpaceWait(err.Error())
+		// The local archive is kept for retry (uploadFile returns nil only on a
+		// confirmed-successful upload, so it was NOT deleted). If the server
+		// rejected the upload for disk space or high load -- including the POST
+		// path where upload.py reports these in an HTTP 200 body -- pause
+		// accordingly so we back off instead of hammering the server.
+		lowerErr := strings.ToLower(err.Error())
+		if strings.Contains(lowerErr, "507") ||
+			strings.Contains(lowerErr, "out of disk space") ||
+			strings.Contains(lowerErr, "system load") ||
+			strings.Contains(lowerErr, "load too high") {
+			reason, pause := classifyServerError(err.Error())
+			ac.pauseUploads(reason, pause, err.Error())
 		}
 		return
 	}
@@ -1006,8 +1091,8 @@ func (ac *AstroCam) makeJobForArchives() {
 
 // makeJobForArea matches Python makeJobForArea function
 func (ac *AstroCam) makeJobForArea(area string) {
-	// Skip if we're in a disk-space wait period — don't pack new archives
-	if ac.isDiskSpaceWait() {
+	// Skip if we're in a pause period — don't pack new archives
+	if ac.isUploadPaused() {
 		return
 	}
 
