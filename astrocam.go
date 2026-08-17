@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -36,10 +37,25 @@ const (
 	// How long to pause uploads after a server-side rejection, by cause.
 	HIGH_LOAD_PAUSE  = 10 * time.Minute // server reported high system load
 	DISK_SPACE_PAUSE = 1 * time.Hour    // server reported out of disk space
+
+	// ninaDateFolderOffset is subtracted from the current time to derive the
+	// date component of NINA's default output folder (.../<YYYY-MM-DD>/LIGHT).
+	// NINA rolls that folder at local noon, i.e. it names the folder after
+	// (now - 12h), so a whole night's images share one folder.
+	ninaDateFolderOffset = 12 * time.Hour
 )
+
+// errServerUnreachable marks a preflight/upload failure caused by the server
+// being unreachable at the network level (DNS failure, timeout, connection
+// refused) - as opposed to a server-side rejection (out of disk space, high
+// load). Only an unreachable primary server triggers fail-over to the optional
+// SAI_FALLBACK_SERVER; a reachable server that rejects the upload is handled by
+// the existing pause-and-retry logic instead.
+var errServerUnreachable = errors.New("server unreachable")
 
 type Config struct {
 	Server             string
+	FallbackServer     string
 	Username           string
 	Password           string
 	CameraDirectory    string
@@ -141,6 +157,8 @@ func loadConfig() *Config {
 		switch key {
 		case "SAI_SERVER":
 			config.Server = value
+		case "SAI_FALLBACK_SERVER":
+			config.FallbackServer = value
 		case "SAI_USERNAME":
 			config.Username = strings.TrimSpace(value)
 		case "SAI_PASSWORD":
@@ -372,6 +390,12 @@ func (ac *AstroCam) fileBrowser(constellation, dir, extPattern string) ([]string
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// The directory does not exist yet (e.g. a NINA date folder that
+			// will be created later tonight). Treat it as empty rather than an
+			// error so we keep probing it on the next scan cycle.
+			return nil, nil
+		}
 		return nil, fmt.Errorf("could not read directory %s: %w", dir, err)
 	}
 
@@ -383,6 +407,47 @@ func (ac *AstroCam) fileBrowser(constellation, dir, extPattern string) ([]string
 	}
 
 	return files, nil
+}
+
+// ninaDateFolderBase reports whether path has NINA's default layout
+// .../<YYYY-MM-DD>/LIGHT and, if so, returns the base directory that holds the
+// dated night folders (the part before <YYYY-MM-DD>). The match is strict: the
+// final path component must be exactly "LIGHT" and its parent must parse as a
+// YYYY-MM-DD date, so ordinary (non-NINA) directories are never affected.
+func ninaDateFolderBase(path string) (base string, ok bool) {
+	clean := filepath.Clean(path)
+	if filepath.Base(clean) != "LIGHT" {
+		return "", false
+	}
+	dateDir := filepath.Dir(clean) // .../<YYYY-MM-DD>
+	if _, err := time.Parse("2006-01-02", filepath.Base(dateDir)); err != nil {
+		return "", false
+	}
+	return filepath.Dir(dateDir), true // .../<base>
+}
+
+// candidateScanDirs returns the directories to scan for new images this cycle.
+// It always includes the user-specified camera directory. When that directory
+// matches NINA's .../<YYYY-MM-DD>/LIGHT layout, it also includes the folder for
+// the current NINA night, whose date is (now - ninaDateFolderOffset). The
+// guessed directory is recomputed on every call (so its name rolls over
+// automatically at the noon boundary) and is returned even when it does not
+// exist yet - astrocam-go started before NINA creates the folder will pick it
+// up on the first cycle after it appears (a missing directory scans as empty).
+func (ac *AstroCam) candidateScanDirs() []string {
+	configured := ac.config.CameraDirectory
+	dirs := []string{configured}
+
+	base, ok := ninaDateFolderBase(configured)
+	if !ok {
+		return dirs
+	}
+	ninaDate := time.Now().Add(-ninaDateFolderOffset).Format("2006-01-02")
+	guessed := filepath.Join(base, ninaDate, "LIGHT")
+	if guessed != filepath.Clean(configured) {
+		dirs = append(dirs, guessed)
+	}
+	return dirs
 }
 
 // sortByNamePart matches Python _sortByNamePart method
@@ -453,10 +518,13 @@ func (ac *AstroCam) getArchiveFiles() ([]string, error) {
 	return files, nil
 }
 
-// getImageFiles matches Python _getImageFiles method
-func (ac *AstroCam) getImageFiles(area string) (*FileGroup, error) {
+// getImageFiles matches Python _getImageFiles method. It scans a single source
+// directory (dir) - the caller decides which candidate directory to pack, so
+// every archive is built from files that share one directory (see
+// packImagesForArea, which changes into dir and archives the files by basename).
+func (ac *AstroCam) getImageFiles(area, dir string) (*FileGroup, error) {
 	// Use the determined FITS extension instead of hardcoded ".fts"
-	files, err := ac.fileBrowser(area, ac.config.CameraDirectory, ac.fitsExtPattern)
+	files, err := ac.fileBrowser(area, dir, ac.fitsExtPattern)
 	if err != nil {
 		return nil, err
 	}
@@ -709,10 +777,13 @@ func (ac *AstroCam) waitForUploadThrottle() {
 	}
 }
 
-// checkServerDiskSpace sends a GET preflight request to check server disk space.
-// Returns status ("ok", "warning", "error", "unknown") and a message string.
-func (ac *AstroCam) checkServerDiskSpace() (string, string) {
-	req, err := http.NewRequest("GET", ac.config.Server, nil)
+// checkServerDiskSpace sends a GET preflight request to the given server to
+// check its disk space and load. Returns a status and a message string. Status
+// is one of: "ok", "warning", "error" (server alive but rejecting),
+// "unreachable" (network-level failure - candidate for fail-over) or "unknown"
+// (server answered without a recognized UNMW_STATUS marker).
+func (ac *AstroCam) checkServerDiskSpace(server string) (string, string) {
+	req, err := http.NewRequest("GET", server, nil)
 	if err != nil {
 		return "unknown", fmt.Sprintf("failed to create request: %v", err)
 	}
@@ -724,7 +795,9 @@ func (ac *AstroCam) checkServerDiskSpace() (string, string) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "unknown", fmt.Sprintf("preflight request failed: %v", err)
+		// Transport-level failure -> the server is unreachable (as opposed to a
+		// server that answers with an error). This is what triggers fail-over.
+		return "unreachable", fmt.Sprintf("preflight request to %s failed: %v", server, err)
 	}
 	defer resp.Body.Close()
 
@@ -750,11 +823,11 @@ func (ac *AstroCam) checkServerDiskSpace() (string, string) {
 }
 
 // packImagesForArea matches Python packImagesForArea method
-func (ac *AstroCam) packImagesForArea(area string) (string, error) {
+func (ac *AstroCam) packImagesForArea(area, dir string) (string, error) {
 	originalDir, _ := os.Getwd()
 	defer os.Chdir(originalDir)
 
-	fileGroup, err := ac.getImageFiles(area)
+	fileGroup, err := ac.getImageFiles(area, dir)
 	if err != nil {
 		return ERROR, err
 	}
@@ -777,13 +850,13 @@ func (ac *AstroCam) packImagesForArea(area string) (string, error) {
 		fmt.Sprintf("%s_%s%s_%s%s%s", 
 			dateStr, ac.config.Prefix, area, timeStr, ac.config.Postfix, ac.archiveExt))
 
-	// Change to camera directory
-	if err := os.Chdir(ac.config.CameraDirectory); err != nil {
+	// Change to the source directory so files are archived by basename
+	if err := os.Chdir(dir); err != nil {
 		if ac.testMode {
-			fmt.Printf("FATAL ERROR (Test Mode): Cannot change to camera directory: %v\n", err)
+			fmt.Printf("FATAL ERROR (Test Mode): Cannot change to image directory %s: %v\n", dir, err)
 			os.Exit(1)
 		}
-		return ERROR, fmt.Errorf("could not change to camera directory: %w", err)
+		return ERROR, fmt.Errorf("could not change to image directory %s: %w", dir, err)
 	}
 
 	// Create archive
@@ -854,11 +927,11 @@ func uploadResponseIndicatesSuccess(body string) bool {
 }
 
 // uploadFile matches FileUploader functionality with proper resource management
-func (ac *AstroCam) uploadFile(filePath string) error {
+func (ac *AstroCam) uploadFile(filePath, server string) error {
 	// Wait for upload throttling (120 seconds between uploads)
 	ac.waitForUploadThrottle()
-	
-	fmt.Printf("Uploading to server: %s\n", filepath.Base(filePath))
+
+	fmt.Printf("Uploading %s to server: %s\n", filepath.Base(filePath), server)
 
 	// Update last upload time before attempting upload
 	ac.lastUploadTime = time.Now()
@@ -888,7 +961,7 @@ func (ac *AstroCam) uploadFile(filePath string) error {
 	writer.Close()
 
 	// Create HTTP request
-	req, err := http.NewRequest("POST", ac.config.Server, &body)
+	req, err := http.NewRequest("POST", server, &body)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -907,11 +980,11 @@ func (ac *AstroCam) uploadFile(filePath string) error {
 	client := &http.Client{Timeout: 300 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		if ac.testMode {
-			fmt.Printf("FATAL ERROR (Test Mode): Upload failed: %v\n", err)
-			os.Exit(1)
-		}
-		return fmt.Errorf("upload failed: %w", err)
+		// Transport-level failure -> the server is unreachable. Wrap the
+		// sentinel so the caller can fail over to SAI_FALLBACK_SERVER instead
+		// of keeping the archive. Test-mode fatality is decided by the caller
+		// once every candidate server has been tried.
+		return fmt.Errorf("%w: upload to %s failed: %v", errServerUnreachable, server, err)
 	}
 	defer resp.Body.Close()
 
@@ -1032,46 +1105,97 @@ func (ac *AstroCam) isUploadPaused() bool {
 }
 
 // makeJobForArchive matches Python makeJobForArchive function
+// uploadServerCandidates returns the servers to try for an upload, in order:
+// the primary SAI_SERVER first, then the optional SAI_FALLBACK_SERVER (when set
+// and different). Fail-over to the fallback happens only when a server is
+// unreachable at the network level - see makeJobForArchive.
+func (ac *AstroCam) uploadServerCandidates() []string {
+	servers := []string{ac.config.Server}
+	fallback := strings.TrimSpace(ac.config.FallbackServer)
+	if fallback != "" && fallback != ac.config.Server {
+		servers = append(servers, fallback)
+	}
+	return servers
+}
+
+// uploadErrorIsServerRejection reports whether an upload error carries a
+// server-side rejection (out of disk space or high load) that warrants a pause.
+func uploadErrorIsServerRejection(err error) bool {
+	lowerErr := strings.ToLower(err.Error())
+	return strings.Contains(lowerErr, "507") ||
+		strings.Contains(lowerErr, "out of disk space") ||
+		strings.Contains(lowerErr, "system load") ||
+		strings.Contains(lowerErr, "load too high")
+}
+
 func (ac *AstroCam) makeJobForArchive(archiveFile string) {
 	// Skip if we're in a pause period set by an earlier server rejection
 	if ac.isUploadPaused() {
 		return
 	}
 
-	// Preflight check: query server status (disk space and system load) before uploading
-	status, msg := ac.checkServerDiskSpace()
-	switch status {
-	case "error":
-		reason, pause := classifyServerError(msg)
-		ac.pauseUploads(reason, pause, msg)
-		return // Archive stays in temp/ for retry
-	case "warning":
-		fmt.Printf("Server disk space warning: %s\n", msg)
-		// Proceed with upload despite warning
-	case "unknown":
-		// Old server or network issue — proceed with upload normally
-	}
+	// Try each candidate server in turn. A server that is unreachable at the
+	// network level is skipped so the next candidate (the fallback) is tried;
+	// a reachable server that rejects the upload (disk space / high load) is
+	// NOT failed over -- it pauses uploads, matching the existing back-off. If
+	// we fall out of the loop, every candidate was unreachable.
+	servers := ac.uploadServerCandidates()
+	for idx, server := range servers {
+		if idx > 0 {
+			fmt.Printf("Primary server unreachable - trying fallback server: %s\n", server)
+		}
 
-	if err := ac.uploadFile(archiveFile); err != nil {
-		fmt.Printf("Upload error: %v\n", err)
+		// Preflight check: query server status (disk space and system load).
+		status, msg := ac.checkServerDiskSpace(server)
+		switch status {
+		case "unreachable":
+			fmt.Printf("Server %s is unreachable: %s\n", server, msg)
+			continue // try the next candidate
+		case "error":
+			reason, pause := classifyServerError(msg)
+			ac.pauseUploads(reason, pause, msg)
+			return // server alive but rejecting -> pause, do not fail over
+		case "warning":
+			fmt.Printf("Server disk space warning: %s\n", msg)
+			// Proceed with upload despite warning
+		case "ok", "unknown":
+			// Proceed with upload normally
+		}
+
+		err := ac.uploadFile(archiveFile, server)
+		if err == nil {
+			if delErr := ac.deleteFile(archiveFile); delErr != nil {
+				fmt.Printf("Warning: Error deleting file after upload: %v\n", delErr)
+			}
+			return
+		}
+
 		// The local archive is kept for retry (uploadFile returns nil only on a
-		// confirmed-successful upload, so it was NOT deleted). If the server
-		// rejected the upload for disk space or high load -- including the POST
-		// path where upload.py reports these in an HTTP 200 body -- pause
-		// accordingly so we back off instead of hammering the server.
-		lowerErr := strings.ToLower(err.Error())
-		if strings.Contains(lowerErr, "507") ||
-			strings.Contains(lowerErr, "out of disk space") ||
-			strings.Contains(lowerErr, "system load") ||
-			strings.Contains(lowerErr, "load too high") {
+		// confirmed-successful upload).
+		if errors.Is(err, errServerUnreachable) {
+			// The server became unreachable during the upload itself -> try the
+			// next candidate.
+			fmt.Printf("Upload to %s failed (unreachable): %v\n", server, err)
+			continue
+		}
+		// Reachable server rejected/failed the upload. If it was out of disk
+		// space or under high load -- including the POST path where upload.py
+		// reports these in an HTTP 200 body -- pause so we back off instead of
+		// hammering the server. Do not fail over on a server-side rejection.
+		fmt.Printf("Upload error (%s): %v\n", server, err)
+		if uploadErrorIsServerRejection(err) {
 			reason, pause := classifyServerError(err.Error())
 			ac.pauseUploads(reason, pause, err.Error())
 		}
 		return
 	}
 
-	if err := ac.deleteFile(archiveFile); err != nil {
-		fmt.Printf("Warning: Error deleting file after upload: %v\n", err)
+	// Every candidate server was unreachable. Keep the archive for a later retry.
+	fmt.Printf("All upload servers are unreachable - keeping archive %s for retry\n",
+		filepath.Base(archiveFile))
+	if ac.testMode {
+		fmt.Printf("FATAL ERROR (Test Mode): all upload servers are unreachable\n")
+		os.Exit(1)
 	}
 }
 
@@ -1089,14 +1213,16 @@ func (ac *AstroCam) makeJobForArchives() {
 	}
 }
 
-// makeJobForArea matches Python makeJobForArea function
-func (ac *AstroCam) makeJobForArea(area string) {
+// makeJobForArea matches Python makeJobForArea function. dir is the source
+// directory (configured camera directory or a guessed NINA date folder) whose
+// images should be packed for this area.
+func (ac *AstroCam) makeJobForArea(area, dir string) {
 	// Skip if we're in a pause period — don't pack new archives
 	if ac.isUploadPaused() {
 		return
 	}
 
-	archiveFile, err := ac.packImagesForArea(area)
+	archiveFile, err := ac.packImagesForArea(area, dir)
 	if err != nil {
 		fmt.Printf("Error processing area %s: %v\n", area, err)
 		return
@@ -1115,33 +1241,54 @@ func (ac *AstroCam) makeJobForArea(area string) {
 	ac.makeJobForArchive(archiveFile)
 }
 
-// makeJobForAreas matches Python makeJobForAreas function
+// makeJobForAreas matches Python makeJobForAreas function. It scans every
+// candidate source directory (the configured camera directory plus, when it
+// looks like a NINA .../<YYYY-MM-DD>/LIGHT path, the folder for the current
+// NINA night). Each directory is packed independently so an archive is never a
+// mix of two nights, and a not-yet-created NINA folder is simply skipped this
+// cycle and re-checked on the next one.
 func (ac *AstroCam) makeJobForAreas() {
 	hasNewFiles := false
-	
-	if _, err := os.Stat(ac.config.CameraDirectory); os.IsNotExist(err) {
-		fmt.Printf("WARNING: Camera directory does not exist: %s\n", ac.config.CameraDirectory)
+
+	dirs := ac.candidateScanDirs()
+
+	// Keep only the directories that currently exist. A NINA date folder may
+	// not exist yet if astrocam-go was started before NINA created it - that is
+	// expected and not an error; we just re-check next cycle.
+	var existingDirs []string
+	for _, d := range dirs {
+		if info, err := os.Stat(d); err == nil && info.IsDir() {
+			existingDirs = append(existingDirs, d)
+		}
+	}
+	if len(existingDirs) == 0 {
+		fmt.Printf("WARNING: none of the image directories exist yet: %v\n", dirs)
 		return
 	}
+	if len(existingDirs) > 1 {
+		fmt.Printf("Scanning %d image directories: %v\n", len(existingDirs), existingDirs)
+	}
 
-	for _, area := range ac.areas {
-		// Check if area has files without processing them - use determined extension
-		files, err := ac.fileBrowser(area, ac.config.CameraDirectory, ac.fitsExtPattern)
-		if err != nil {
-			continue
-		}
-		
-		// Debug output to help troubleshooting
-		if len(files) > 0 {
-			fmt.Printf("INFO: Area '%s' has %d files (need %d)\n", area, len(files), ac.config.Count)
-		}
-		
-		if len(files) >= ac.config.Count {
-			hasNewFiles = true
-			ac.makeJobForArea(area)
+	for _, dir := range existingDirs {
+		for _, area := range ac.areas {
+			// Check if area has files without processing them - use determined extension
+			files, err := ac.fileBrowser(area, dir, ac.fitsExtPattern)
+			if err != nil {
+				continue
+			}
+
+			// Debug output to help troubleshooting
+			if len(files) > 0 {
+				fmt.Printf("INFO: Area '%s' in %s has %d files (need %d)\n", area, dir, len(files), ac.config.Count)
+			}
+
+			if len(files) >= ac.config.Count {
+				hasNewFiles = true
+				ac.makeJobForArea(area, dir)
+			}
 		}
 	}
-	
+
 	// In test mode, track if we've found files yet
 	if ac.testMode && hasNewFiles {
 		ac.testStartTime = time.Now() // Reset timeout when we find files

@@ -33,6 +33,19 @@ It's a complete rewrite of the original Python astrocam code in Go, with improve
 - **Upload Throttling**: 120-second delays between uploads to prevent server overload
 - **Graceful Degradation**: Continues processing even if some files fail to move
 
+### ✅ **Fallback Upload Server**
+- **Automatic Fail-Over**: If the primary server (`SAI_SERVER`) is unreachable, the archive is uploaded to an optional fallback server (`SAI_FALLBACK_SERVER`) instead
+- **Only on Unreachability**: Fail-over happens only for network-level failures (DNS failure, timeout, connection refused). A server that *is* reachable but reports "out of disk space" or "high system load" is **not** failed over — uploads pause and later retry the primary, exactly as before
+- **Shared Credentials**: The fallback server uses the same `SAI_USERNAME` / `SAI_PASSWORD`
+- **Optional**: Leave `SAI_FALLBACK_SERVER` empty (or omit it) to disable
+
+### ✅ **NINA Date-Folder Auto-Detection**
+- **Rolling Date Folders**: [NINA](https://nighttime-imaging.eu/) stores images in `.../<YYYY-MM-DD>/LIGHT` folders named after the current observing night — the date at local noon, i.e. `now − 12 hours`, so a whole night shares one folder
+- **Automatic**: When `SAI_CAMERA_DIRECTORY` ends with `.../<YYYY-MM-DD>/LIGHT`, AstroCam also scans the folder for the current NINA night. The name is recomputed on every scan cycle, so it rolls over on its own — no need to edit the config each night
+- **Configured Directory Always Scanned**: The directory set in `SAI_CAMERA_DIRECTORY` is always scanned too, so non-NINA setups and explicitly chosen paths keep working
+- **Start-Early Safe**: AstroCam can be started before NINA creates the folder — a not-yet-created folder is simply skipped and re-checked next cycle, then picked up as soon as it appears
+- **Per-Folder Archives**: Each source folder is packed independently, so an archive never mixes images from two different nights
+
 ### ✅ **Cross-Platform Compatibility**
 - **Windows**: 32-bit and 64-bit versions
 - **Linux**: Native support
@@ -70,6 +83,7 @@ Same `config.env` format as original Python version:
 
 ```bash
 SAI_SERVER=https://your-server.com/upload.py
+SAI_FALLBACK_SERVER=                 # Optional: used only if SAI_SERVER is unreachable
 SAI_USERNAME=your_username           # Optional: leave empty for no auth
 SAI_PASSWORD=your_password           # Optional: leave empty for no auth  
 SAI_CAMERA_DIRECTORY=C:\Camera\Images
@@ -79,6 +93,9 @@ SAI_COUNT=3
 SAI_PREFIX=
 SAI_POSTFIX=_STL-11000M
 ```
+
+- **`SAI_FALLBACK_SERVER`** (optional): a second upload URL used only when `SAI_SERVER` is unreachable at the network level. It reuses `SAI_USERNAME` / `SAI_PASSWORD`. See *Fallback Upload Server* above.
+- **`SAI_CAMERA_DIRECTORY`**: if this ends with `.../<YYYY-MM-DD>/LIGHT`, AstroCam additionally scans the folder for the current NINA night (`now − 12 hours`), recomputed each cycle. No extra option is needed — see *NINA Date-Folder Auto-Detection* above.
 
 ## Building
 
@@ -215,6 +232,16 @@ echo "AstroCam test passed"
 - **Error**: HTTP 401/403 errors
 - **Solution**: Check SAI_USERNAME and SAI_PASSWORD in config.env
 - **Note**: Leave empty for servers that don't require authentication
+
+### **Upload Fail-Over**
+- **Behavior**: When the primary server is unreachable, uploads go to `SAI_FALLBACK_SERVER` (if set); the log shows `Primary server unreachable - trying fallback server: ...`
+- **Note**: A server that reports "out of disk space" or "high system load" is reachable, so it pauses/retries the primary instead of failing over
+- **All Unreachable**: If no server can be reached, the archive is kept locally and retried on the next cycle
+
+### **NINA Folder Not Detected**
+- **Check**: `SAI_CAMERA_DIRECTORY` must end with `.../<YYYY-MM-DD>/LIGHT` (the final `LIGHT` and a valid `YYYY-MM-DD` parent are both required)
+- **Behavior**: The guessed folder uses `now − 12 hours`; before local noon this is the previous calendar date, matching NINA's own convention
+- **Log**: When both the configured and guessed folders exist, the log shows `Scanning N image directories: [...]`
 
 ### **File Move Errors**
 - **Error**: "Cannot move file" messages
