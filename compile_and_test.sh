@@ -17,6 +17,13 @@ fi
 GO_VERSION=$(go version | grep -oP 'go\K[0-9]+\.[0-9]+')
 echo "✓ Go version: $GO_VERSION"
 
+# Run the unit tests before building anything
+echo ""
+echo "Running unit tests..."
+go vet ./...
+go test ./...
+echo "OK unit tests passed"
+
 # Build executables
 echo ""
 echo "Building astrocam-go for Linux..."
@@ -101,17 +108,11 @@ else
         for i in {1..3}; do
             timestamp=$(date +"%Y-%m-%d_%H-%M-%S" -d "+$i seconds")
             filename="${area}_${timestamp}_STL-11000M.fts"
-            # Create files with some content to test archiving and config file lookup
-            cat > "test_data/1_semka/$filename" << EOF
-Mock FITS data for testing area $area file $i
-This file tests the new config file location feature.
-The executable should find config.env next to the binary.
-Generated at: $(date)
-Area: $area
-Sequence: $i
-Filename: $filename
-Test data for archive creation and upload testing.
-EOF
+            # A real 2880 byte FITS record: astrocam only packs files that
+            # look like finished FITS files.
+            { printf '%-80s' 'SIMPLE  =                    T' 'BITPIX  =                    8' \
+                       'NAXIS   =                    0' 'END'
+                printf '%2560s' ''; } > "test_data/1_semka/$filename"
         done
     done
 fi
@@ -280,9 +281,12 @@ else
     rm -f test_data/1_semka/* test_data/2_otpravleno/* temp/* 2>/dev/null || true
     for area in 064; do
         for i in 1 2 3; do
-            timestamp="2025-01-0${i}_12-00-0${i}"
+            # One visit: the frames must be seconds apart, not days
+            timestamp="2025-01-01_12-00-0${i}"
             filename="${area}_${timestamp}_STL-11000M.fts"
-            echo "Mock FITS data for disk space test" > "test_data/1_semka/$filename"
+            { printf '%-80s' 'SIMPLE  =                    T' 'BITPIX  =                    8' \
+                       'NAXIS   =                    0' 'END'
+                printf '%2560s' ''; } > "test_data/1_semka/$filename"
         done
     done
 

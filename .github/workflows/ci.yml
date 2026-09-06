@@ -50,14 +50,11 @@ jobs:
             for i in {1..3}; do
               timestamp=$(date +"%Y-%m-%d_%H-%M-%S" -d "+$i seconds")
               filename="${area}_${timestamp}_test_STL-11000M.fts"
-              # Create files with content to test new config file location feature
-              cat > "test_data/1_semka/$filename" << FITEOF
-          Mock FITS data for CI testing area $area file $i
-          Testing smart config file location detection.
-          Config files are found next to executable first, then current directory.
-          Generated: $(date)
-          Area: $area, Sequence: $i
-          FITEOF
+              # A real 2880 byte FITS record: astrocam only packs files that
+              # look like finished FITS files.
+              { printf '%-80s' 'SIMPLE  =                    T' 'BITPIX  =                    8' \
+                       'NAXIS   =                    0' 'END'
+                printf '%2560s' ''; } > "test_data/1_semka/$filename"
             done
           done
 
@@ -74,6 +71,11 @@ jobs:
             echo "⚠ RAR command not found - will test ZIP format (built-in)"
             echo "This is normal - ZIP format works without external dependencies"
           fi
+
+      - name: Run unit tests
+        run: |
+          go vet ./...
+          go test ./...
 
       - name: Build Linux version
         run: |
@@ -222,9 +224,12 @@ jobs:
           rm -f test_data/1_semka/* test_data/2_otpravleno/* temp/* 2>/dev/null || true
           mkdir -p test_data/1_semka test_data/2_otpravleno temp
           for i in 1 2 3; do
-            timestamp="2025-01-0${i}_12-00-0${i}"
+            # One visit: the frames must be seconds apart, not days
+            timestamp="2025-01-01_12-00-0${i}"
             filename="064_${timestamp}_STL-11000M.fts"
-            echo "Mock FITS data" > "test_data/1_semka/$filename"
+            { printf '%-80s' 'SIMPLE  =                    T' 'BITPIX  =                    8' \
+                       'NAXIS   =                    0' 'END'
+                printf '%2560s' ''; } > "test_data/1_semka/$filename"
           done
 
           # Configure to use mock server
@@ -318,16 +323,13 @@ jobs:
               for ($i = 1; $i -le 3; $i++) {
                   $timestamp = (Get-Date).AddSeconds($i).ToString("yyyy-MM-dd_HH-mm-ss")
                   $filename = "${area}_${timestamp}_test_STL-11000M.fts"
-                  # Create files with content to test new config file location feature
-                  $content = @"
-          Mock FITS data for Windows CI testing area $area file $i
-          Testing smart config file location detection on Windows.
-          Config files are found next to executable first, then current directory.
-          Generated: $(Get-Date)
-          Area: $area, Sequence: $i
-          Windows path handling test.
-          "@
-                  Set-Content -Path "test_data/1_semka/$filename" -Value $content
+                  # A real 2880 byte FITS record: astrocam only packs files
+                  # that look like finished FITS files. Write bytes so no text
+                  # encoding or trailing newline is added.
+                  $hdr = 'SIMPLE  =                    T'.PadRight(80) + 'BITPIX  =                    8'.PadRight(80) +
+                      'NAXIS   =                    0'.PadRight(80) + 'END'.PadRight(80)
+                  [IO.File]::WriteAllBytes("$PWD/test_data/1_semka/$filename",
+                      [Text.Encoding]::ASCII.GetBytes($hdr.PadRight(2880)))
               }
           }
 
@@ -348,6 +350,12 @@ jobs:
               Write-Host "Note: WinRAR can be installed to enable RAR format testing"
               Write-Host "ZIP format works without external dependencies"
           }
+
+      - name: Run unit tests
+        shell: pwsh
+        run: |
+          go vet ./...
+          go test ./...
 
       - name: Build Windows version
         shell: pwsh
@@ -555,13 +563,11 @@ jobs:
             for i in {1..3}; do
               timestamp=$(date +"%Y-%m-%d_%H-%M-%S" -d "+$i seconds")
               filename="${area}_${timestamp}_test_STL-11000M.fts"
-              # Create small files with content for real upload test
-              cat > "test_data/1_semka/$filename" << EOF
-          Integration test data for area $area file $i
-          Testing smart config location with real server upload.
-          Generated: $(date)
-          File size optimized for integration testing.
-          EOF
+              # A real 2880 byte FITS record: astrocam only packs files that
+              # look like finished FITS files.
+              { printf '%-80s' 'SIMPLE  =                    T' 'BITPIX  =                    8' \
+                       'NAXIS   =                    0' 'END'
+                printf '%2560s' ''; } > "test_data/1_semka/$filename"
             done
           done
 
@@ -651,15 +657,12 @@ jobs:
           for ($i = 1; $i -le 3; $i++) {
               $timestamp = (Get-Date).AddSeconds($i).ToString("yyyy-MM-dd_HH-mm-ss")
               $filename = "${area}_${timestamp}_test_STL-11000M.fts"
-              # Create small files with content for real upload test
-              $content = @"
-          Integration test data for area $area file $i
-          Testing smart config location with real server upload.
-          Generated: $(Get-Date)
-          Windows integration test with config file detection.
-          File size optimized for integration testing.
-          "@
-              Set-Content -Path "test_data/1_semka/$filename" -Value $content
+              # A real 2880 byte FITS record, written as bytes so no text
+              # encoding or trailing newline is added.
+              $hdr = 'SIMPLE  =                    T'.PadRight(80) + 'BITPIX  =                    8'.PadRight(80) +
+                  'NAXIS   =                    0'.PadRight(80) + 'END'.PadRight(80)
+              [IO.File]::WriteAllBytes("$PWD/test_data/1_semka/$filename",
+                  [Text.Encoding]::ASCII.GetBytes($hdr.PadRight(2880)))
           }
 
           Write-Host "Created integration test files:"
