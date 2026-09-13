@@ -102,13 +102,40 @@ type AstroCam struct {
 	rarPath          string // Path to rar executable (if found)
 	testMode         bool   // Whether running in test mode
 	testStartTime    time.Time
-	fitsExtPattern   string               // Regex pattern matching all FITS file extensions (.fts, .fits, .fit)
-	uploadPauseUntil time.Time            // Skip uploads until this time after a server-side rejection (high load or out of disk space)
-	areaPatterns     []*regexp.Regexp     // one compiled matcher per areas entry, same order
-	stamps           map[string]fileStamp // size and mtime of each candidate on the previous cycle
-	rejects          map[string]int       // per-archive count of server content rejections
-	noVisit          map[string]int       // per-area frame count already reported as "no single visit"
-	lastScanSet      string               // last scan set printed, so it is logged only when it changes
+	fitsExtPattern   string                       // Regex pattern matching all FITS file extensions (.fts, .fits, .fit)
+	uploadPauseUntil time.Time                    // Skip uploads until this time after a server-side rejection (high load or out of disk space)
+	areaPatterns     []*regexp.Regexp             // one compiled matcher per areas entry, same order
+	stamps           map[string]fileStamp         // size and mtime of each candidate on the previous cycle
+	rejects          map[string]int               // per-archive count of server content rejections
+	noVisit          map[string]int               // per-area frame count already reported as "no single visit"
+	lastScanSet      string                       // last scan set printed, so it is logged only when it changes
+	conditions       map[string]*problemCondition // standing problems, by kind; empty when all is well
+	queueSummary     string                       // one-line description of what is waiting to be delivered
+	queuedCount      int                          // how many archives are waiting, for the short reminder line
+}
+
+// problemCondition is a fault that outlasts the moment it happened - the server
+// being out of disk space, an unreachable network, and so on.
+//
+// The program prints plenty of one-shot messages, but an operator does not read
+// a log, they GLANCE at a terminal. Anything announced once scrolls out of sight
+// within a minute and the window then shows nothing but cheerful scanning
+// chatter - which is exactly how an hour-long upload outage went unnoticed on
+// 2026-09-12. So a condition is held in memory and restated on EVERY cycle for
+// as long as it lasts, and its end is announced too: the operator should never
+// have to wonder whether the problem went away or merely stopped being
+// mentioned.
+//
+// An empty (or nil) AstroCam.conditions map means "healthy", so an AstroCam
+// built by hand in a test needs no new initialisation.
+type problemCondition struct {
+	severity string    // "ERROR" or "WARNING"
+	reason   string    // short cause, e.g. "server is out of disk space"
+	detail   string    // the server's own words, or the underlying error text
+	action   string    // what astrocam-go is doing about it, in plain language
+	since    time.Time // when it was first seen
+	until    time.Time // when a timed pause expires; zero if not time-based
+	cycles   int       // how many scan cycles it has lasted
 }
 
 type FileGroup struct {
@@ -430,6 +457,7 @@ func NewAstroCam(testMode bool) (*AstroCam, error) {
 	ac.stamps = make(map[string]fileStamp)
 	ac.rejects = make(map[string]int)
 	ac.noVisit = make(map[string]int)
+	ac.conditions = make(map[string]*problemCondition)
 
 	// Compile one matcher per area once here, rather than rebuilding them on
 	// every directory scan. QuoteMeta keeps an area name that happens to
@@ -1334,6 +1362,168 @@ func formatPauseDuration(d time.Duration) string {
 	return d.String()
 }
 
+// formatElapsedDuration renders an arbitrary age as "3h 07m", "12m 30s" or
+// "45s" - short enough for a status line, precise enough to tell at a glance
+// whether a problem started a minute or a night ago.
+func formatElapsedDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d >= time.Hour {
+		return fmt.Sprintf("%dh %02dm", int(d/time.Hour), int(d/time.Minute)%60)
+	}
+	if d >= time.Minute {
+		return fmt.Sprintf("%dm %02ds", int(d/time.Minute), int(d/time.Second)%60)
+	}
+	return fmt.Sprintf("%ds", int(d/time.Second))
+}
+
+// The kinds of standing problem. One condition is kept per kind, so a server
+// that is down and a camera directory that has gone missing are both visible at
+// the same time instead of overwriting each other.
+const (
+	conditionDelivery = "delivery" // archives cannot be handed over to the server
+	conditionInput    = "input"    // images cannot be read from the camera directories
+	conditionArchive  = "archive"  // one particular archive is being refused over and over
+)
+
+// How many times the server has to refuse the same archive before it is called
+// out as a standing problem. Two refusals can be a hiccup; three is a pattern.
+const rejectsBeforeWarning = 3
+
+// A long banner every 15 seconds would bury everything else, and a message
+// printed only once is invisible to an operator who walks up an hour later. So
+// the full banner is repeated every conditionFullBannerEveryCycles cycles and a
+// one-line reminder is printed on every cycle in between, always as the last
+// thing in the cycle - whatever the terminal is showing, the bottom of the
+// screen names the problem.
+const conditionFullBannerEveryCycles = 20
+
+// setCondition records, or refreshes, a standing problem. Re-setting the same
+// reason keeps the original start time, which is what lets the banner say how
+// long the observatory has been unable to deliver data.
+func (ac *AstroCam) setCondition(kind, severity, reason, detail, action string, until time.Time) {
+	if ac.conditions == nil {
+		ac.conditions = make(map[string]*problemCondition)
+	}
+	if existing := ac.conditions[kind]; existing != nil && existing.reason == reason {
+		existing.severity = severity
+		existing.detail = detail
+		existing.action = action
+		existing.until = until
+		return
+	}
+	ac.conditions[kind] = &problemCondition{
+		severity: severity,
+		reason:   reason,
+		detail:   detail,
+		action:   action,
+		since:    time.Now(),
+		until:    until,
+	}
+}
+
+// clearCondition announces that a standing problem is over and forgets it.
+// Silence is not an acceptable way to report a recovery: the operator has been
+// staring at an error for hours and must be told, in words, that it is gone.
+func (ac *AstroCam) clearCondition(kind, resolution string) {
+	cond := ac.conditions[kind]
+	if cond == nil {
+		return
+	}
+	delete(ac.conditions, kind)
+	fmt.Printf("\n=== RESOLVED: %s - %s (the problem lasted %s).\n\n",
+		cond.reason, resolution, formatElapsedDuration(time.Since(cond.since)))
+}
+
+// hasCondition reports whether a standing problem of this kind is in force.
+func (ac *AstroCam) hasCondition(kind string) bool {
+	return ac.conditions[kind] != nil
+}
+
+// reportConditions is called at the end of every cycle and is the whole point
+// of the condition bookkeeping: as long as something is wrong, the last lines
+// on the terminal say what it is, how long it has been wrong, and what
+// astrocam-go is doing about it.
+func (ac *AstroCam) reportConditions() {
+	// Fixed order, so the same problem always appears in the same place.
+	for _, kind := range []string{conditionDelivery, conditionInput, conditionArchive} {
+		cond := ac.conditions[kind]
+		if cond == nil {
+			continue
+		}
+		cond.cycles++
+		if cond.cycles == 1 || cond.cycles%conditionFullBannerEveryCycles == 0 {
+			ac.printConditionBanner(cond)
+		} else {
+			ac.printConditionReminder(cond)
+		}
+	}
+}
+
+// conditionBannerWidth is the width the banner text is folded to. Narrow enough
+// to survive the 80 column console window the telescope machines actually run,
+// so an explanation does not turn into an unreadable ribbon of wrapped text.
+const conditionBannerWidth = 66
+
+// printWrapped prints one piece of banner text, folded at whole words so it
+// stays within conditionBannerWidth columns.
+func printWrapped(prefix, text string) {
+	line := ""
+	for _, word := range strings.Fields(text) {
+		switch {
+		case line == "":
+			line = word
+		case len(line)+1+len(word) <= conditionBannerWidth:
+			line += " " + word
+		default:
+			fmt.Printf("%s%s\n", prefix, line)
+			line = word
+		}
+	}
+	if line != "" {
+		fmt.Printf("%s%s\n", prefix, line)
+	}
+}
+
+// printConditionBanner prints the full description of a standing problem.
+func (ac *AstroCam) printConditionBanner(cond *problemCondition) {
+	fmt.Printf("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+	printWrapped("!!! ", cond.severity+": "+cond.reason)
+	fmt.Printf("!!! Started %s (%s ago).\n",
+		cond.since.Format("2006-01-02 15:04:05"), formatElapsedDuration(time.Since(cond.since)))
+	if detail := strings.TrimSpace(cond.detail); detail != "" {
+		for _, line := range strings.Split(detail, "\n") {
+			printWrapped("!!!   ", line)
+		}
+	}
+	printWrapped("!!! ", "What astrocam-go is doing: "+cond.action)
+	if !cond.until.IsZero() {
+		fmt.Printf("!!! Next retry at %s (in %s).\n",
+			cond.until.Format("15:04:05"), formatElapsedDuration(time.Until(cond.until)))
+	}
+	if ac.queueSummary != "" {
+		printWrapped("!!! ", ac.queueSummary)
+	}
+	fmt.Printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n")
+}
+
+// printConditionReminder prints the single-line version shown on the cycles
+// between full banners. It is kept under 80 characters so that it stays one
+// line in the console window and cannot be mistaken for ordinary chatter.
+func (ac *AstroCam) printConditionReminder(cond *problemCondition) {
+	retry := ""
+	if !cond.until.IsZero() {
+		retry = ", retry " + cond.until.Format("15:04:05")
+	}
+	queue := ""
+	if ac.queuedCount > 0 {
+		queue = fmt.Sprintf(", %d waiting", ac.queuedCount)
+	}
+	fmt.Printf("!!! %s %s: %s%s%s\n",
+		cond.severity, formatElapsedDuration(time.Since(cond.since)), cond.reason, queue, retry)
+}
+
 // classifyServerError inspects a server UNMW_STATUS:ERROR body (or an upload
 // error string) and returns a human-readable reason and the pause duration to
 // apply: out of disk space pauses for DISK_SPACE_PAUSE, high system load for
@@ -1358,8 +1548,31 @@ func classifyServerError(body string) (string, time.Duration) {
 	return "Server reported a temporary error", HIGH_LOAD_PAUSE
 }
 
+// operatorAdviceFor turns a machine-side reason into the one thing a human at
+// the telescope can actually do about it. Printing "what to do" next to "what
+// is wrong" is the difference between a message that gets acted on and one that
+// gets ignored.
+func operatorAdviceFor(reason string) string {
+	lower := strings.ToLower(reason)
+	if strings.Contains(lower, "disk space") {
+		return "Nothing is lost: images keep being packed here and every archive is " +
+			"retried until the server confirms it. To fix it, free disk space on the " +
+			"upload server - astrocam-go cannot do that from here."
+	}
+	if strings.Contains(lower, "load") {
+		return "Nothing is lost: the archives are kept and retried. The server should " +
+			"recover on its own; no action is needed unless this lasts for hours."
+	}
+	if strings.Contains(lower, "unreachable") {
+		return "Nothing is lost: the archives are kept and retried. Check the network " +
+			"connection and that the upload server is up."
+	}
+	return "Nothing is lost: the archives are kept and retried until the server accepts them."
+}
+
 // pauseUploads records that uploads must be skipped until a future time and
-// prints an informative message naming the cause and how long the pause lasts.
+// raises a standing condition so the pause stays on screen for as long as it
+// lasts, instead of scrolling away after one line.
 // In test mode, a server-side rejection is fatal (exit immediately).
 func (ac *AstroCam) pauseUploads(reason string, duration time.Duration, detail string) {
 	if ac.testMode {
@@ -1367,19 +1580,37 @@ func (ac *AstroCam) pauseUploads(reason string, duration time.Duration, detail s
 		os.Exit(1)
 	}
 	ac.uploadPauseUntil = time.Now().Add(duration)
-	fmt.Printf("%s. Pausing uploads for %s, will retry after %s.\nServer response: %s\n",
-		reason, formatPauseDuration(duration),
-		ac.uploadPauseUntil.Format("15:04:05"), strings.TrimSpace(detail))
+	// Only the headline here: the banner printed at the end of this same cycle
+	// carries the server's own words, the elapsed time and what happens next,
+	// and repeating all of that twice in a row only makes it easier to skip.
+	fmt.Printf("%s. Pausing uploads for %s, will retry after %s.\n",
+		reason, formatPauseDuration(duration), ac.uploadPauseUntil.Format("15:04:05"))
+	ac.setCondition(conditionDelivery, "ERROR", reason,
+		"Server response: "+strings.TrimSpace(detail),
+		fmt.Sprintf("waiting %s before trying again, and packing new images in the meantime. %s",
+			formatPauseDuration(duration), operatorAdviceFor(reason)),
+		ac.uploadPauseUntil)
 }
 
 // isUploadPaused returns true if we are still within a pause window set after a
 // server-side rejection (high load or out of disk space).
+//
+// When the window runs out the condition is deliberately NOT cleared here: the
+// pause ending only means it is time to try again, not that the server has
+// room. The condition is cleared when an upload actually succeeds, so a disk
+// that stays full stays on screen as one continuous problem rather than being
+// declared fixed once an hour.
 func (ac *AstroCam) isUploadPaused() bool {
 	if ac.uploadPauseUntil.IsZero() {
 		return false
 	}
 	if time.Now().After(ac.uploadPauseUntil) {
 		ac.uploadPauseUntil = time.Time{} // Reset
+		if cond := ac.conditions[conditionDelivery]; cond != nil {
+			cond.until = time.Time{}
+			cond.action = "retrying the upload now. " + operatorAdviceFor(cond.reason)
+			fmt.Printf("The pause after \"%s\" is over - retrying the upload now.\n", cond.reason)
+		}
 		return false
 	}
 	return true
@@ -1441,6 +1672,11 @@ func (ac *AstroCam) pickServer(servers []string, from int) (string, int, bool) {
 		fmt.Printf("FATAL ERROR (Test Mode): all upload servers are unreachable\n")
 		os.Exit(1)
 	}
+	ac.setCondition(conditionDelivery, "ERROR", "Upload server is unreachable",
+		"Tried: "+strings.Join(servers, ", "),
+		"retrying every cycle, and packing new images in the meantime. "+
+			operatorAdviceFor("unreachable"),
+		time.Time{})
 	return "", 0, false
 }
 
@@ -1455,9 +1691,8 @@ func (ac *AstroCam) uploadPhase() {
 	archives, err := ac.getArchiveFiles()
 	if err != nil {
 		fmt.Printf("Error scanning archive files: %v\n", err)
-		return
-	}
-	if len(archives) == 0 {
+		ac.queueSummary = ""
+		ac.queuedCount = 0
 		return
 	}
 
@@ -1467,12 +1702,34 @@ func (ac *AstroCam) uploadPhase() {
 			waiting += info.Size()
 		}
 	}
-	fmt.Printf("%d archive(s) waiting to be delivered (%d MB), oldest is %s\n",
-		len(archives), waiting/(1024*1024), filepath.Base(archives[0]))
+	ac.queuedCount = len(archives)
+	if len(archives) == 0 {
+		ac.queueSummary = ""
+	} else {
+		ac.queueSummary = fmt.Sprintf("%d archive(s) waiting to be delivered (%d MB), oldest is %s",
+			len(archives), waiting/(1024*1024), filepath.Base(archives[0]))
+		fmt.Printf("%s\n", ac.queueSummary)
+	}
 
+	// The pause is checked before the empty-queue shortcut on purpose. An empty
+	// queue is not proof that anything was delivered - the very first symptom of
+	// a full server is a queue that has not been emptied - and skipping the
+	// check here used to leave the standing pause completely unreported.
 	if ac.isUploadPaused() {
-		fmt.Printf("Uploads are paused until %s; the archives are kept and retried after that.\n",
-			ac.uploadPauseUntil.Format("15:04:05"))
+		// Nothing is printed here on purpose: the standing banner at the end of
+		// the cycle already says why the pause exists, how long it has lasted
+		// and when the next attempt is due.
+		return
+	}
+	if len(archives) == 0 {
+		// Nothing to hand over. If the server was known to be in trouble, ask it
+		// how it is doing anyway: a standing error must be either confirmed or
+		// withdrawn, never left on the screen unchecked.
+		if ac.hasCondition(conditionDelivery) {
+			if _, _, ok := ac.pickServer(ac.uploadServerCandidates(), 0); ok {
+				ac.clearCondition(conditionDelivery, "the upload server is reachable and has room again")
+			}
+		}
 		return
 	}
 
@@ -1494,6 +1751,13 @@ func (ac *AstroCam) uploadPhase() {
 		err := ac.uploadFile(archiveFile, server)
 		if err == nil {
 			delete(ac.rejects, archiveFile)
+			// An archive the server has confirmed is the only proof that
+			// delivery really works, so this is where a standing delivery
+			// problem is declared over.
+			ac.clearCondition(conditionDelivery, "an archive was delivered successfully")
+			if len(ac.rejects) == 0 {
+				ac.clearCondition(conditionArchive, "every archive has been accepted")
+			}
 			if delErr := ac.deleteFile(archiveFile); delErr != nil {
 				fmt.Printf("Warning: Error deleting file after upload: %v\n", delErr)
 			}
@@ -1524,6 +1788,18 @@ func (ac *AstroCam) uploadPhase() {
 		// The server refused this particular archive. Keep it and let it fall
 		// behind the others, so one archive cannot hold up the whole queue.
 		ac.rejects[archiveFile]++
+		if ac.rejects[archiveFile] >= rejectsBeforeWarning {
+			// One archive the server keeps refusing is a different illness from
+			// a server that is down, and it will never fix itself: say so
+			// instead of letting it circle the queue forever in silence.
+			ac.setCondition(conditionArchive, "WARNING",
+				"The server keeps refusing an archive",
+				fmt.Sprintf("%s has been refused %d times. Last answer: %v",
+					filepath.Base(archiveFile), ac.rejects[archiveFile], err),
+				"still delivering the other archives and retrying this one last, every cycle. "+
+					"It is most likely damaged; it can be removed from the temp directory by hand.",
+				time.Time{})
+		}
 	}
 }
 
@@ -1544,9 +1820,15 @@ func (ac *AstroCam) makeJobForAreas() {
 		}
 	}
 	if len(existing) == 0 {
-		fmt.Printf("WARNING: none of the image directories exist yet: %v\n", dirs)
+		ac.setCondition(conditionInput, "ERROR", "No camera image directory can be found",
+			fmt.Sprintf("Looked for: %v", dirs),
+			"looking again every cycle. Nothing can be packed or uploaded until one of "+
+				"these directories exists - check that the camera software is running and "+
+				"writing where CAMERA_DIRECTORY says it does.",
+			time.Time{})
 		return
 	}
+	ac.clearCondition(conditionInput, "a camera image directory is readable again")
 	if set := fmt.Sprintf("%v", existing); set != ac.lastScanSet {
 		fmt.Printf("Scanning %d image directories: %v\n", len(existing), existing)
 		ac.lastScanSet = set
@@ -1677,6 +1959,11 @@ func (ac *AstroCam) programLoop() {
 
 	fmt.Printf("Delivering archives... %s\n", time.Now().Format("2006-01-02 15:04:05"))
 	ac.uploadPhase()
+
+	// Last, so that whatever else this cycle printed, the bottom of the terminal
+	// carries any problem that is still going on. An operator who glances at the
+	// window sees the fault, not the scanning chatter that came after it.
+	ac.reportConditions()
 
 	// Check test timeout
 	ac.checkTestTimeout()

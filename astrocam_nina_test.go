@@ -614,3 +614,180 @@ func TestAreaMatchIgnoresExtensionCase(t *testing.T) {
 		t.Errorf("the area name should stay case-sensitive")
 	}
 }
+
+// A visit is grouped by the gap between consecutive frames, never by the date
+// they fall on, so no calendar boundary can split one. This covers UTC
+// midnight (DATE-OBS is UTC), local midnight, the year boundary, and the
+// autumn DST step where the local clock repeats an hour.
+func TestSelectVisitIgnoresCalendarBoundaries(t *testing.T) {
+	chicago, err := time.LoadLocation("America/Chicago")
+	if err != nil {
+		t.Skip("no timezone database")
+	}
+
+	cases := []struct {
+		name  string
+		first time.Time
+	}{
+		{"UTC midnight", time.Date(2026, 9, 3, 23, 59, 50, 0, time.UTC)},
+		{"local midnight", time.Date(2026, 9, 3, 23, 59, 50, 0, chicago)},
+		{"year boundary", time.Date(2026, 12, 31, 23, 59, 50, 0, time.UTC)},
+		{"month boundary", time.Date(2026, 9, 30, 23, 59, 50, 0, time.UTC)},
+		{"DST fall-back", time.Date(2026, 11, 1, 1, 59, 50, 0, chicago)},
+	}
+
+	for _, c := range cases {
+		second := c.first.Add(22 * time.Second) // a real pair is 37 to 48 s apart
+		cands := []candidate{
+			{name: "b.fits", when: second},
+			{name: "a.fits", when: c.first},
+		}
+		got := selectVisit(cands, 2, visitGap)
+		if len(got) != 2 {
+			t.Errorf("%s: the pair was split, got %d frame(s)", c.name, len(got))
+			continue
+		}
+		if got[0].name != "a.fits" || got[1].name != "b.fits" {
+			t.Errorf("%s: frames out of order: %v", c.name, names(got))
+		}
+	}
+
+	// The same 22 second pair must still be kept apart from a later visit,
+	// whichever side of midnight that visit falls on.
+	first := time.Date(2026, 9, 3, 23, 59, 50, 0, time.UTC)
+	cands := []candidate{
+		{name: "a.fits", when: first},
+		{name: "b.fits", when: first.Add(22 * time.Second)},
+		{name: "c.fits", when: first.Add(40 * time.Minute)},
+		{name: "d.fits", when: first.Add(40*time.Minute + 22*time.Second)},
+	}
+	got := selectVisit(cands, 2, visitGap)
+	if len(got) != 2 || got[0].name != "a.fits" || got[1].name != "b.fits" {
+		t.Errorf("the earlier visit was not chosen intact: %v", names(got))
+	}
+	for _, c := range got {
+		if c.name == "c.fits" || c.name == "d.fits" {
+			t.Errorf("a frame from the later visit leaked in: %v", names(got))
+		}
+	}
+}
+
+// captureStdout runs f with os.Stdout redirected and returns what was printed.
+// The condition messages exist to be read by a human, so the tests check the
+// actual terminal output rather than the internal bookkeeping alone.
+func captureStdout(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	saved := os.Stdout
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		var sb strings.Builder
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				sb.Write(buf[:n])
+			}
+			if err != nil {
+				break
+			}
+		}
+		done <- sb.String()
+	}()
+	f()
+	os.Stdout = saved
+	w.Close()
+	out := <-done
+	r.Close()
+	return out
+}
+
+func TestConditionIsRepeatedEveryCycle(t *testing.T) {
+	ac := testCam(t, &Config{}, []string{"Field"})
+	ac.queueSummary = "3 archive(s) waiting to be delivered (1200 MB), oldest is old.zip"
+	ac.queuedCount = 3
+
+	out := captureStdout(t, func() {
+		ac.setCondition(conditionDelivery, "ERROR", "Server is out of disk space",
+			"Server response: no space left on device",
+			"waiting 1 hour before trying again", time.Now().Add(time.Hour))
+		// The first cycle prints the full banner, later ones a reminder line,
+		// but every single cycle has to say something.
+		for i := 0; i < 4; i++ {
+			ac.reportConditions()
+		}
+	})
+
+	if n := strings.Count(out, "Server is out of disk space"); n != 4 {
+		t.Errorf("the standing problem was named %d times in 4 cycles, want 4:\n%s", n, out)
+	}
+	if !strings.Contains(out, "!!! ERROR: Server is out of disk space") {
+		t.Errorf("no full banner on the first cycle:\n%s", out)
+	}
+	if !strings.Contains(out, "!!! ERROR 0s: Server is out of disk space, 3 waiting") {
+		t.Errorf("no per-cycle reminder after the banner:\n%s", out)
+	}
+	if !strings.Contains(out, "oldest is old.zip") {
+		t.Errorf("the queue summary is missing, so the operator cannot see how much is stuck:\n%s", out)
+	}
+	if !strings.Contains(out, "no space left on device") {
+		t.Errorf("the server's own words are missing from the banner:\n%s", out)
+	}
+}
+
+func TestConditionKeepsItsStartTimeAndIsWithdrawnOutLoud(t *testing.T) {
+	ac := testCam(t, &Config{}, []string{"Field"})
+	ac.setCondition(conditionDelivery, "ERROR", "Server is out of disk space", "first", "waiting", time.Time{})
+	started := ac.conditions[conditionDelivery].since
+
+	// The same problem seen again must not look like a brand new one, otherwise
+	// the banner can never say how long the observatory has been stuck.
+	ac.setCondition(conditionDelivery, "ERROR", "Server is out of disk space", "second", "waiting", time.Time{})
+	if !ac.conditions[conditionDelivery].since.Equal(started) {
+		t.Errorf("re-reporting the same problem restarted its clock")
+	}
+	if ac.conditions[conditionDelivery].detail != "second" {
+		t.Errorf("the refreshed detail was not kept: %q", ac.conditions[conditionDelivery].detail)
+	}
+
+	out := captureStdout(t, func() {
+		ac.clearCondition(conditionDelivery, "an archive was delivered successfully")
+	})
+	if !strings.Contains(out, "RESOLVED") {
+		t.Errorf("the end of the problem was not announced:\n%s", out)
+	}
+	if ac.hasCondition(conditionDelivery) {
+		t.Errorf("the condition survived being cleared")
+	}
+
+	// Clearing something that is not there must stay silent.
+	if out := captureStdout(t, func() { ac.clearCondition(conditionDelivery, "again") }); out != "" {
+		t.Errorf("clearing a condition that was not set printed %q", out)
+	}
+}
+
+func TestPauseExpiryDoesNotDeclareTheProblemFixed(t *testing.T) {
+	ac := testCam(t, &Config{}, []string{"Field"})
+	ac.setCondition(conditionDelivery, "ERROR", "Server is out of disk space", "full", "waiting", time.Now().Add(time.Hour))
+	ac.uploadPauseUntil = time.Now().Add(-time.Second) // the hour is up
+
+	out := captureStdout(t, func() {
+		if ac.isUploadPaused() {
+			t.Errorf("still paused after the window ran out")
+		}
+	})
+	if strings.Contains(out, "RESOLVED") {
+		t.Errorf("the end of the pause was mistaken for the end of the problem:\n%s", out)
+	}
+	if !ac.hasCondition(conditionDelivery) {
+		t.Errorf("the standing problem was dropped when the pause expired, so a server "+
+			"that is still full would go unreported: %v", ac.conditions)
+	}
+	if !ac.conditions[conditionDelivery].until.IsZero() {
+		t.Errorf("the expired retry time is still being advertised")
+	}
+}
