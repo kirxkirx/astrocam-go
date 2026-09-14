@@ -32,6 +32,8 @@ It's a complete rewrite of the original Python astrocam code in Go, with improve
 - **File Move Retry**: Automatically retries failed file moves (handles file locks). A frame is never deleted just because a file of the same name is already in the processed directory
 - **Atomic Archives**: archives are built in `temp/incoming` and moved into `temp/` only after passing an integrity test, so a crash or a full disk cannot leave a half-written archive to be uploaded
 - **Upload Throttling**: 120-second delays between uploads to prevent server overload
+- **Slow Links**: one upload attempt may take up to 15 minutes, and progress is printed while it runs. The log distinguishes a transfer that is moving slowly, one that has stalled, and one where the whole archive has arrived and the server has not yet answered
+- **A Timeout Is Not An Unreachable Server**: running out of time is reported as a slow or stalled transfer, never as an unreachable server, and does not fail over to the fallback. Note that each retry restarts from the beginning, so an archive that cannot be delivered within the timeout will never be delivered until the link is faster or the archive is smaller
 - **Graceful Degradation**: Continues processing even if some files fail to move
 
 ### ✅ **Fallback Upload Server**

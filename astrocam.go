@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -65,6 +66,19 @@ const (
 	// uploadPhaseBudget bounds how long one cycle may spend uploading, so that
 	// a long retry queue can never starve the packing of new images.
 	uploadPhaseBudget = 10 * time.Minute
+
+	// uploadTimeout bounds one whole upload attempt. Go counts the CONNECTION,
+	// the time spent handing the archive to the network, the server's
+	// processing and the reply against this single figure, so it has to cover
+	// a big archive on a slow uplink: a 35 MB archive needs about 1 Mbit/s to
+	// finish inside 300 s, which a poor link does not always have. An attempt
+	// that runs out of time here is retried from the beginning on the next
+	// cycle, so a link that cannot deliver the archive within this limit never
+	// delivers it at all - hence the generous value.
+	uploadTimeout = 900 * time.Second
+
+	// How often the upload prints how far it has got.
+	uploadProgressInterval = 20 * time.Second
 )
 
 // errServerUnreachable marks a preflight/upload failure caused by the server
@@ -74,6 +88,13 @@ const (
 // SAI_FALLBACK_SERVER; a reachable server that rejects the upload is handled by
 // the existing pause-and-retry logic instead.
 var errServerUnreachable = errors.New("server unreachable")
+
+// errUploadTimeout marks an upload that ran out of time. The server answered
+// the preflight and accepted the connection, so it is NOT unreachable: either
+// the link is too slow to deliver the archive, or the server is taking too
+// long to reply. Keeping this apart from errServerUnreachable is what stops
+// the log from blaming a perfectly reachable server.
+var errUploadTimeout = errors.New("upload timed out")
 
 type Config struct {
 	Server             string
@@ -1230,6 +1251,124 @@ func uploadResponseIndicatesSuccess(body string) bool {
 		strings.Contains(lower, "unmw_status:ok")
 }
 
+// humanBytes renders a byte count the way an operator reads it.
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1024*1024*1024:
+		return fmt.Sprintf("%.1f GB", float64(n)/(1024*1024*1024))
+	case n >= 1024*1024:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1024*1024))
+	case n >= 1024:
+		return fmt.Sprintf("%.1f kB", float64(n)/1024)
+	}
+	return fmt.Sprintf("%d bytes", n)
+}
+
+// uploadProgress counts how much of the archive has been handed to the
+// network. It exists so that the three states an upload can be in are told
+// apart in the log: moving slowly, not moving at all, or fully sent and
+// waiting on the server.
+type uploadProgress struct {
+	total    int64
+	sent     int64 // atomic
+	bodyDone int32 // atomic; 1 once the whole body has been handed over
+	doneAt   int64 // atomic; UnixNano when that happened
+}
+
+// progressReader feeds the request body and counts what goes out.
+type progressReader struct {
+	inner *bytes.Reader
+	prog  *uploadProgress
+}
+
+func (r *progressReader) Read(b []byte) (int, error) {
+	n, err := r.inner.Read(b)
+	if n > 0 {
+		atomic.AddInt64(&r.prog.sent, int64(n))
+	}
+	if err == io.EOF && atomic.CompareAndSwapInt32(&r.prog.bodyDone, 0, 1) {
+		atomic.StoreInt64(&r.prog.doneAt, time.Now().UnixNano())
+	}
+	return n, err
+}
+
+// reportUploadProgress prints one line every uploadProgressInterval until the
+// returned stop function is called. Because it runs on its own timer it also
+// prints while the transfer is stuck, which is exactly the case that is
+// otherwise indistinguishable from a hung program.
+func reportUploadProgress(prog *uploadProgress, server string) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(uploadProgressInterval)
+		defer ticker.Stop()
+
+		started := time.Now()
+		lastSent := int64(0)
+		lastTime := started
+		waitingReported := false
+
+		for {
+			select {
+			case <-stop:
+				return
+			case now := <-ticker.C:
+				sent := atomic.LoadInt64(&prog.sent)
+
+				if atomic.LoadInt32(&prog.bodyDone) == 1 {
+					// The archive is on its way out; the server now has to
+					// unpack, validate and answer.
+					waited := now.Sub(time.Unix(0, atomic.LoadInt64(&prog.doneAt)))
+					if !waitingReported {
+						fmt.Printf("  upload: all %s sent in %v, now WAITING FOR THE SERVER to reply\n",
+							humanBytes(prog.total), now.Sub(started).Round(time.Second))
+						waitingReported = true
+					} else {
+						fmt.Printf("  upload: still waiting for the server to reply (%v so far)\n",
+							waited.Round(time.Second))
+					}
+					lastSent, lastTime = sent, now
+					continue
+				}
+
+				delta := sent - lastSent
+				elapsed := now.Sub(lastTime).Seconds()
+				if elapsed <= 0 {
+					elapsed = 1
+				}
+				rate := float64(delta) / elapsed
+
+				if delta == 0 {
+					// A slow link delivers in bursts, so report the average
+					// since the start as well: that tells a bursty transfer
+					// that is still progressing from a dead one.
+					overall := float64(sent) / now.Sub(started).Seconds()
+					fmt.Printf("  upload: NOTHING SENT in the last %v - %s of %s so far (%s/s on average over %v)\n",
+						now.Sub(lastTime).Round(time.Second), humanBytes(sent), humanBytes(prog.total),
+						humanBytes(int64(overall)), now.Sub(started).Round(time.Second))
+				} else {
+					percent := 100.0 * float64(sent) / float64(prog.total)
+					remaining := "unknown"
+					if rate > 0 {
+						remaining = time.Duration(float64(prog.total-sent) / rate * float64(time.Second)).Round(time.Second).String()
+					}
+					fmt.Printf("  upload: %s of %s (%.0f%%) at %s/s, about %s left\n",
+						humanBytes(sent), humanBytes(prog.total), percent,
+						humanBytes(int64(rate)), remaining)
+				}
+				lastSent, lastTime = sent, now
+			}
+		}
+	}()
+
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
 // uploadFile matches FileUploader functionality with proper resource management
 func (ac *AstroCam) uploadFile(filePath, server string) error {
 	// Wait for upload throttling (120 seconds between uploads)
@@ -1264,11 +1403,19 @@ func (ac *AstroCam) uploadFile(filePath, server string) error {
 
 	writer.Close()
 
+	// Feed the body through a counter so the log can say how far the upload
+	// has got. The length is set by hand because wrapping the buffer hides it
+	// from net/http, and without a Content-Length the request would go out
+	// chunked, which the CGI on the other end does not expect.
+	prog := &uploadProgress{total: int64(body.Len())}
+	reader := &progressReader{inner: bytes.NewReader(body.Bytes()), prog: prog}
+
 	// Create HTTP request
-	req, err := http.NewRequest("POST", server, &body)
+	req, err := http.NewRequest("POST", server, reader)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
+	req.ContentLength = prog.total
 
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
@@ -1280,17 +1427,48 @@ func (ac *AstroCam) uploadFile(filePath, server string) error {
 		fmt.Printf("Uploading without authentication (no credentials provided)\n")
 	}
 
-	// Send request with timeout for large files/slow server
-	client := &http.Client{Timeout: 300 * time.Second}
+	fmt.Printf("Sending %s to %s (giving up after %v)\n",
+		humanBytes(prog.total), server, uploadTimeout)
+
+	// Send request. The timeout covers the whole exchange: connecting, handing
+	// over the archive, the server's processing and the reply.
+	client := &http.Client{Timeout: uploadTimeout}
+	started := time.Now()
+	stopProgress := reportUploadProgress(prog, server)
 	resp, err := client.Do(req)
+	stopProgress()
 	if err != nil {
-		// Transport-level failure -> the server is unreachable. Wrap the
-		// sentinel so the caller can fail over to SAI_FALLBACK_SERVER instead
-		// of keeping the archive. Test-mode fatality is decided by the caller
-		// once every candidate server has been tried.
-		return fmt.Errorf("%w: upload to %s failed: %v", errServerUnreachable, server, err)
+		sent := atomic.LoadInt64(&prog.sent)
+		elapsed := time.Since(started)
+
+		// A timeout is NOT an unreachable server: the connection was made and
+		// the server answered the preflight moments ago. Saying which of the
+		// three things ran out of time is the whole point of these messages.
+		if os.IsTimeout(err) {
+			if atomic.LoadInt32(&prog.bodyDone) == 1 {
+				return fmt.Errorf("%w: the whole archive (%s) reached %s, but the server did not reply within %v. The server is REACHABLE and has the data; it is taking too long to answer",
+					errUploadTimeout, humanBytes(prog.total), server, uploadTimeout)
+			}
+			if sent == 0 {
+				return fmt.Errorf("%w: not one byte of the archive left this machine in %v to %s. The connection was accepted but nothing could be written - suspect a firewall or a dead link, NOT a missing server",
+					errUploadTimeout, elapsed.Round(time.Second), server)
+			}
+			rate := float64(sent) / elapsed.Seconds()
+			needed := time.Duration(float64(prog.total) / rate * float64(time.Second))
+			return fmt.Errorf("%w: only %s of %s reached %s in %v (%s/s). The server is REACHABLE - the link is too slow: this archive needs about %v at that rate. Every retry starts again from the beginning, so it will keep failing until the link is faster, the archive is smaller, or uploadTimeout is raised",
+				errUploadTimeout, humanBytes(sent), humanBytes(prog.total), server,
+				elapsed.Round(time.Second), humanBytes(int64(rate)), needed.Round(time.Second))
+		}
+
+		// Anything else at the transport level means we never got a usable
+		// connection: that is a genuinely unreachable server.
+		return fmt.Errorf("%w: upload to %s failed after %v: %v",
+			errServerUnreachable, server, elapsed.Round(time.Second), err)
 	}
 	defer resp.Body.Close()
+
+	fmt.Printf("  upload: %s delivered and answered in %v\n",
+		humanBytes(prog.total), time.Since(started).Round(time.Second))
 
 	// Read response body to detect disk space warnings/errors
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
@@ -1765,6 +1943,17 @@ func (ac *AstroCam) uploadPhase() {
 		}
 
 		fmt.Printf("Upload error (%s): %v\n", server, err)
+
+		// A timeout means the server IS reachable, so do not fail over to the
+		// other server as if it had vanished, and do not let the queue grind
+		// through every archive at uploadTimeout each. Keep the archive and
+		// come back next cycle.
+		if errors.Is(err, errUploadTimeout) {
+			fmt.Printf("The archive is kept and will be retried. Note that the server answered its\n")
+			fmt.Printf("preflight check moments ago, so this is a SLOW or STALLED TRANSFER, not an\n")
+			fmt.Printf("unreachable server.\n")
+			return
+		}
 
 		if errors.Is(err, errServerUnreachable) {
 			// The upload itself died at the network level. Move on to the next
