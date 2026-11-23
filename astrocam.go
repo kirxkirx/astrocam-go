@@ -163,7 +163,7 @@ type AstroCam struct {
 	areaPatterns     []*regexp.Regexp             // one compiled matcher per areas entry, same order
 	stamps           map[string]fileStamp         // size and mtime of each candidate on the previous cycle
 	rejects          map[string]int               // per-archive count of server content rejections
-	firstRefusal     map[string]time.Time         // when each archive still waiting was first refused
+	refusedAfter     map[string]int               // uploadedCount when each archive still waiting was first refused
 	lastScanSet      string                       // last scan set printed, so it is logged only when it changes
 	conditions       map[string]*problemCondition // standing problems, by kind; empty when all is well
 	queueSummary     string                       // one-line description of what is waiting to be delivered
@@ -537,7 +537,7 @@ func NewAstroCam(testMode bool) (*AstroCam, error) {
 	ac.fitsExtPattern = fitsExtensionPattern
 	ac.stamps = make(map[string]fileStamp)
 	ac.rejects = make(map[string]int)
-	ac.firstRefusal = make(map[string]time.Time)
+	ac.refusedAfter = make(map[string]int)
 	ac.conditions = make(map[string]*problemCondition)
 	ac.label = buildLabel()
 
@@ -863,7 +863,7 @@ func (ac *AstroCam) refreshQueue() ([]string, error) {
 	for a := range ac.rejects {
 		if !queued[a] {
 			delete(ac.rejects, a)
-			delete(ac.firstRefusal, a)
+			delete(ac.refusedAfter, a)
 		}
 	}
 	if ac.hasCondition(conditionArchive) && !ac.anyArchiveRefusedOften() {
@@ -2810,7 +2810,7 @@ func (ac *AstroCam) uploadPhase() {
 		err := ac.uploadFile(archiveFile, server)
 		if err == nil {
 			delete(ac.rejects, archiveFile)
-			delete(ac.firstRefusal, archiveFile)
+			delete(ac.refusedAfter, archiveFile)
 			ac.uploadedCount++
 			ac.lastUploadOK = time.Now()
 			ac.serverAskedAt, ac.serverOKAt = ac.lastUploadOK, ac.lastUploadOK
@@ -2915,12 +2915,17 @@ func (ac *AstroCam) uploadPhase() {
 // temp directory by hand" in every case, which is an invitation to delete good
 // data whenever the trouble is really on the server. Only when other archives
 // have been accepted in the meantime does the evidence point at this one.
+//
+// "In the meantime" is judged by counting the archives the server has
+// confirmed, not by comparing clock times: two events moments apart can carry
+// the same time on a coarse clock (Windows), and the archive would then be
+// said to have nothing to compare it with although others went through.
 func (ac *AstroCam) noteRefusal(archiveFile string, err error) {
-	if ac.firstRefusal == nil {
-		ac.firstRefusal = make(map[string]time.Time)
+	if ac.refusedAfter == nil {
+		ac.refusedAfter = make(map[string]int)
 	}
-	if _, seen := ac.firstRefusal[archiveFile]; !seen {
-		ac.firstRefusal[archiveFile] = time.Now()
+	if _, seen := ac.refusedAfter[archiveFile]; !seen {
+		ac.refusedAfter[archiveFile] = ac.uploadedCount
 	}
 	ac.rejects[archiveFile]++
 	times := ac.rejects[archiveFile]
@@ -2939,7 +2944,7 @@ func (ac *AstroCam) noteRefusal(archiveFile string, err error) {
 				"so the fault is on this computer: another program may be holding the file "+
 				"open, or the disk is failing.",
 			time.Time{})
-	case ac.lastUploadOK.After(ac.firstRefusal[archiveFile]):
+	case ac.uploadedCount > ac.refusedAfter[archiveFile]:
 		ac.setCondition(conditionArchive, "WARNING",
 			"The server keeps refusing one archive",
 			fmt.Sprintf("%s has been refused %d times, while other archives were accepted. Last answer: %s",

@@ -819,7 +819,7 @@ func TestRefusalBlame(t *testing.T) {
 	// One archive refused while another goes through: now it is the archive.
 	ac = testCam(t, &Config{Count: 2}, []string{"Field"})
 	ac.noteRefusal("/temp/a.zip", refusal)
-	ac.lastUploadOK = time.Now().Add(time.Second) // another archive was accepted afterwards
+	ac.uploadedCount++ // another archive was accepted afterwards
 	ac.noteRefusal("/temp/a.zip", refusal)
 	ac.noteRefusal("/temp/a.zip", refusal)
 	cond = ac.conditions[conditionArchive]
