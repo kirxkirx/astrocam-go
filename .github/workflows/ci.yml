@@ -520,7 +520,10 @@ jobs:
   integration-test-linux:
     runs-on: ubuntu-latest
     needs: [test-linux, test-windows]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Switched off for now: the test server named by the TEST_SERVER_URL secret
+    # sits behind a Privoxy proxy that cannot reach it ("503 - Forwarding
+    # failure"). To switch this job on again, drop "false &&" from the condition.
+    if: false && github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
       - name: Checkout code
@@ -634,7 +637,8 @@ jobs:
   integration-test-windows:
     runs-on: windows-latest
     needs: [test-linux, test-windows]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Switched off for now, like integration-test-linux above.
+    if: false && github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
       - name: Checkout code

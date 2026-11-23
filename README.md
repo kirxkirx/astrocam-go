@@ -655,9 +655,10 @@ GOOS=windows GOARCH=386   go build -ldflags="-s -w" -o astrocam-go-win32.exe
 - **CI** (`.github/workflows/ci.yml`) runs the unit tests, builds for Linux and
   Windows, and runs the program on both with an upload address where nothing
   answers. On Linux it also runs it against a mock server that reports a full
-  disk. On pushes to `main` it uploads a tiny archive to a real server, set by
-  the repository secret `TEST_SERVER_URL`; that server refuses it for its size,
-  which proves that it was reached.
+  disk. On pushes to `main` it can also upload a tiny archive to a real server,
+  set by the repository secret `TEST_SERVER_URL`; that server refuses it for its
+  size, which proves that it was reached. These two jobs are switched off for
+  now, because that server cannot be reached.
 - **Releases** (`.github/workflows/release.yml`): pushing a tag such as `v0.6.0`
   builds the programs with that version and publishes a GitHub release. It does
   not run the tests, so push `main` and wait for CI to pass first.
