@@ -71,16 +71,6 @@ const (
 	// a long retry queue can never starve the packing of new images.
 	uploadPhaseBudget = 10 * time.Minute
 
-	// uploadTimeout bounds one whole upload attempt. Go counts the CONNECTION,
-	// the time spent handing the archive to the network, the server's
-	// processing and the reply against this single figure, so it has to cover
-	// a big archive on a slow uplink: a 35 MB archive needs about 1 Mbit/s to
-	// finish inside 300 s, which a poor link does not always have. An attempt
-	// that runs out of time here is retried from the beginning on the next
-	// cycle, so a link that cannot deliver the archive within this limit never
-	// delivers it at all - hence the generous value.
-	uploadTimeout = 900 * time.Second
-
 	// How often the upload prints how far it has got.
 	uploadProgressInterval = 20 * time.Second
 
@@ -105,6 +95,17 @@ const (
 	// the time of day that starts the first one, so the text lines up.
 	statusIndent = "         "
 )
+
+// uploadTimeout bounds one whole upload attempt. Go counts the CONNECTION,
+// the time spent handing the archive to the network, the server's processing
+// and the reply against this single figure, so it has to cover a big archive
+// on a slow uplink: a 35 MB archive needs about 1 Mbit/s to finish inside
+// 300 s, which a poor link does not always have. An attempt that runs out of
+// time here is retried from the beginning on the next cycle, so a link that
+// cannot deliver the archive within this limit never delivers it at all -
+// hence the generous value. It is a variable only so that the tests can make
+// an upload run out of time without waiting 15 minutes.
+var uploadTimeout = 900 * time.Second
 
 // errStopping marks an operation that was abandoned because the operator asked
 // the program to stop. Nothing is wrong with the archive or with the server.
@@ -186,6 +187,7 @@ type AstroCam struct {
 	openFields     map[string]bool // fields that had new images within visitGap on the previous scan
 	leftoversTold  bool            // the summary of old incomplete sets has been printed
 	strayCount     int             // recent FITS files that match no field in areas.txt
+	stranded       map[string]bool // images of uploaded archives that could not leave the camera folder
 	strayTold      int             // how many there were when they were last explained
 	strayToldCycle int             // the cycle in which they were last explained
 }
@@ -436,9 +438,12 @@ func determineArchiveSettings(config *Config) (useRAR bool, zipCompressed bool, 
 		useRAR = false
 		zipCompressed = false
 		archiveExt = ".zip"
-	case "auto":
-		fallthrough
 	default:
+		if config.ArchiveMode != "auto" {
+			fmt.Printf("Warning: unknown SAI_ARCHIVE_MODE '%s' (use auto, rar, zip or zip-uncompressed), using auto\n",
+				config.ArchiveMode)
+			config.ArchiveMode = "auto"
+		}
 		// Auto mode: prefer RAR if available, otherwise compressed ZIP
 		if rarAvailable {
 			useRAR = true
@@ -463,25 +468,13 @@ func NewAstroCam(testMode bool) (*AstroCam, error) {
 	// Determine archive settings based on config
 	useRAR, zipCompressed, archiveExt, rarPath := determineArchiveSettings(config)
 
-	// Display mode and archive type information
 	modeStr := "NORMAL OPERATION"
 	if testMode {
 		modeStr = "TEST"
 	}
 
-	var archiveTypeDesc string
-	if useRAR {
-		archiveTypeDesc = fmt.Sprintf("RAR (using %s)", rarPath)
-	} else if zipCompressed {
-		archiveTypeDesc = "ZIP compressed (built-in)"
-	} else {
-		archiveTypeDesc = "ZIP uncompressed (built-in)"
-	}
-
 	fmt.Printf("=== ASTROCAM STARTING IN %s MODE ===\n", modeStr)
 	fmt.Printf("Version: %s\n", buildLabel())
-	fmt.Printf("Archive mode: %s\n", config.ArchiveMode)
-	fmt.Printf("Archive format: %s\n", archiveTypeDesc)
 
 	// Determine executable directory (matching Python logic)
 	execPath, err := os.Executable()
@@ -561,6 +554,7 @@ func NewAstroCam(testMode bool) (*AstroCam, error) {
 		ac.areaPatterns = append(ac.areaPatterns, re)
 	}
 
+	ac.finishPartialCopies()
 	return ac, nil
 }
 
@@ -899,18 +893,23 @@ func plural(n int, one, many string) string {
 }
 
 // moveImages moves the frames of a packed archive into the processed
-// directory. It reports an error when any of them could not be moved, because
-// a frame left in the camera directory is packed again on a later cycle and
-// the same images are then delivered twice.
+// directory. A frame left in the camera directory can be packed again on a
+// later cycle, and the same images are then delivered twice.
 //
 // A frame is never deleted just because a file of the same name already exists
 // in the processed directory: that would destroy an image which was never
 // delivered under that name. Such a file is left alone for a human to sort out.
-func (ac *AstroCam) moveImages(files []string) error {
+//
+// It returns the frames that did not get there, together with the last error.
+// Such a frame is usually still in the camera directory, but not always: one
+// that another program took away fails too, and so does one whose rename went
+// through but reported an error. Whether the archive may then be thrown away
+// is for the caller to decide (see allOfferedAgain).
+func (ac *AstroCam) moveImages(files []string) ([]string, error) {
 	const maxRetries = 2
-	const retryDelay = 3 * time.Second
 
 	var failed []string
+	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		failed = nil
 
@@ -921,38 +920,180 @@ func (ac *AstroCam) moveImages(files []string) error {
 			if _, err := os.Stat(targetPath); err == nil {
 				fmt.Printf("Error: %s already exists in the processed directory; leaving the camera copy in place\n",
 					basename)
+				lastErr = fmt.Errorf("%s already exists in the processed directory", basename)
 				failed = append(failed, file)
 				continue
 			}
 
-			if err := os.Rename(file, targetPath); err != nil {
+			err := renameImage(file, targetPath)
+			if errors.Is(err, errCrossDevice) {
+				// The processed folder is on another drive, where a rename
+				// cannot go. That used to fail every move, throw away every
+				// archive and upload nothing at all.
+				var copied bool
+				copied, err = moveAcrossDrives(file, targetPath)
+				if copied {
+					// The image is safely in the processed folder; its name
+					// there keeps a leftover original from being packed again.
+					if err != nil {
+						fmt.Printf("Warning: %s was copied into the processed directory, but the original could not be deleted (%v). It is not packed again; delete it by hand.\n",
+							basename, err)
+					}
+					continue
+				}
+			}
+			if err != nil {
 				fmt.Printf("Error: Cannot move file %s (attempt %d/%d): %v\n",
 					basename, attempt, maxRetries, err)
+				lastErr = err
 				failed = append(failed, file)
 			}
 		}
 
 		if len(failed) == 0 {
-			return nil
+			return nil, nil
 		}
 		if attempt < maxRetries {
-			fmt.Printf("Waiting %v before retry...\n", retryDelay)
-			time.Sleep(retryDelay)
+			fmt.Printf("Waiting %v before retry...\n", moveRetryDelay)
+			time.Sleep(moveRetryDelay)
 			files = failed
 		}
 	}
-
-	fmt.Printf("WARNING: %d image file(s) stayed in the camera directory:\n", len(failed))
-	for _, file := range failed {
-		fmt.Printf("  - %s\n", filepath.Base(file))
-	}
-	fmt.Printf("The archive itself is complete and will be delivered. These frames will be packed again on a later cycle, which sends them twice.\n")
 
 	if ac.testMode {
 		fmt.Printf("FATAL ERROR (Test Mode): Failed to move %d files after %d attempts\n", len(failed), maxRetries)
 		os.Exit(1)
 	}
-	return fmt.Errorf("%d image file(s) could not be moved", len(failed))
+	return failed, lastErr
+}
+
+// moveRetryDelay is how long moveImages waits before it tries a failed move
+// once more: long enough for a program that briefly held the file to let go.
+var moveRetryDelay = 3 * time.Second
+
+// renameImage moves an image into the processed directory. It is a variable
+// so that the tests can make it fail the way a rename to another drive does.
+var renameImage = os.Rename
+
+// moveAcrossDrives moves an image to another drive or filesystem, where a
+// rename cannot take it: it copies the file next to its destination under a
+// temporary name, makes sure every byte is on the disk, renames the copy into
+// place and only then deletes the original. Until the rename the original is
+// untouched and no partial file is left behind.
+//
+// copied reports whether the destination now holds a complete copy. It can be
+// true together with an error, when the original could not be deleted.
+func moveAcrossDrives(src, dst string) (copied bool, err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return false, err
+	}
+	info, err := in.Stat()
+	if err != nil {
+		in.Close()
+		return false, err
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".*"+partialCopySuffix)
+	if err != nil {
+		in.Close()
+		return false, err
+	}
+	n, err := io.Copy(tmp, in)
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	// The original must be closed before it can be deleted on Windows.
+	in.Close()
+	if err == nil && n != info.Size() {
+		err = fmt.Errorf("copied %d of %d bytes", n, info.Size())
+	}
+	if err != nil {
+		os.Remove(tmp.Name())
+		return false, fmt.Errorf("could not copy %s to %s: %w", filepath.Base(src), filepath.Dir(dst), err)
+	}
+	// Keep the permissions and the time the image was taken, as a move would:
+	// the temporary file was created readable by this user alone.
+	os.Chmod(tmp.Name(), info.Mode().Perm())
+	os.Chtimes(tmp.Name(), info.ModTime(), info.ModTime())
+	if err := os.Rename(tmp.Name(), dst); err != nil {
+		os.Remove(tmp.Name())
+		return false, err
+	}
+	// The renamed copy should survive a power cut before the original goes.
+	// Best effort: some filesystems cannot sync a folder, and on Windows this
+	// does nothing; finishPartialCopies at the next start covers the rest.
+	syncDir(filepath.Dir(dst))
+	if err := os.Remove(src); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// partialCopySuffix ends the name of a copy that moveAcrossDrives has not
+// renamed into place yet. One left behind by a crash is dealt with at the next
+// start, by finishPartialCopies.
+const partialCopySuffix = ".partial"
+
+// partialCopyName matches the names moveAcrossDrives gives its copies: a dot,
+// the image name, a dot and the random digits of os.CreateTemp, the suffix.
+var partialCopyName = regexp.MustCompile(`^\.(.+)\.[0-9]+` + regexp.QuoteMeta(partialCopySuffix) + `$`)
+
+// finishPartialCopies deals with the copies that a crash in the middle of
+// moveAcrossDrives left in the processed directory. When the image is in place
+// already, or its original is still in a camera folder, the leftover copy is
+// not needed and is deleted. Otherwise it may be the only copy left - the
+// original can be gone from the camera folder when a power cut came before the
+// rename into place reached the disk: a complete one is renamed into place,
+// which finishes the move, and an incomplete one is left for a person to look
+// at. A possible only copy is never deleted.
+func (ac *AstroCam) finishPartialCopies() {
+	dir := ac.config.ProcessedDirectory
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	var cameraDirs []string
+	for _, e := range entries {
+		m := partialCopyName.FindStringSubmatch(e.Name())
+		if e.IsDir() || m == nil || !fitsNamePattern.MatchString(m[1]) {
+			continue
+		}
+		image := m[1]
+		leftover := filepath.Join(dir, e.Name())
+		final := filepath.Join(dir, image)
+
+		_, finalErr := os.Stat(final)
+		inCamera := false
+		if finalErr != nil {
+			if cameraDirs == nil {
+				cameraDirs = ac.scanDirs()
+			}
+			for _, d := range cameraDirs {
+				if _, err := os.Stat(filepath.Join(d, image)); err == nil {
+					inCamera = true
+					break
+				}
+			}
+		}
+		if finalErr == nil || inCamera {
+			if os.Remove(leftover) == nil {
+				fmt.Printf("Removed an unfinished copy of %s left by an earlier run\n", image)
+			}
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			if _, _, complete := isCompleteFITS(leftover, info.Size()); complete && os.Rename(leftover, final) == nil {
+				fmt.Printf("Finished moving %s into the processed directory (the move was interrupted)\n", image)
+				continue
+			}
+		}
+		fmt.Printf("Warning: %s may be the only copy of %s, but it is not complete; it is left for you to check\n",
+			leftover, image)
+	}
 }
 
 // createZipArchive creates ZIP archive using Go's built-in zip library
@@ -1442,27 +1583,97 @@ func (ac *AstroCam) packVisit(area string, visit []candidate) (string, error) {
 		return ERROR, fmt.Errorf("could not move the finished archive into %s: %w", ac.tempDirectory, err)
 	}
 
-	if err := ac.moveImages(paths); err != nil {
-		stayed := 0
-		for _, path := range paths {
-			if _, statErr := os.Stat(path); statErr == nil {
-				stayed++
-			}
+	// From here on images leave the camera folder, so the archive should be
+	// on the disk first: after a power cut it may be their only copy. This is
+	// best effort and never a reason to hold back the archive.
+	if err := syncFile(finalPath); err != nil {
+		fmt.Printf("Warning: could not make sure archive %s is on the disk: %v\n", filepath.Base(finalPath), err)
+	}
+	syncDir(ac.tempDirectory)
+
+	notMoved, err := ac.moveImages(paths)
+	if len(notMoved) == len(paths) && ac.allOfferedAgain(paths) {
+		// Every frame is still in the camera directory, and will be offered
+		// again by the next scan, so this archive is not the only copy of
+		// anything. Throw it away rather than deliver the same visit again on
+		// every cycle from now on.
+		os.Remove(finalPath)
+		return ERROR, fmt.Errorf("%w (%v), so archive %s was thrown away. They stay in the camera folder and are tried again on the next cycle",
+			errImagesNotMoved, err, filepath.Base(finalPath))
+	}
+	var stranded, vanished, doubled []string
+	for _, path := range notMoved {
+		_, inCamera := os.Stat(path)
+		_, inProcessed := os.Stat(filepath.Join(ac.config.ProcessedDirectory, filepath.Base(path)))
+		switch {
+		case inCamera != nil:
+			vanished = append(vanished, path)
+		case inProcessed == nil:
+			doubled = append(doubled, path)
+		default:
+			stranded = append(stranded, path)
 		}
-		if stayed == len(paths) {
-			// Every frame is still in the camera directory, so this archive is
-			// not the only copy of anything. Throw it away rather than deliver
-			// the same visit again on every cycle from now on.
-			os.Remove(finalPath)
-			return ERROR, fmt.Errorf("archive %s discarded because none of its frames could be moved: %w",
-				filepath.Base(finalPath), err)
+	}
+	if len(vanished) > 0 {
+		fmt.Printf("Warning: %s of archive %s disappeared from the camera folder before it could be moved; the archive is kept and uploaded.\n",
+			plural(len(vanished), "image", "images"), filepath.Base(finalPath))
+	}
+	if len(doubled) > 0 {
+		fmt.Printf("Warning: %s of archive %s reached the processed directory but also stayed in the camera folder; they are not packed again. Delete them from the camera folder by hand:\n",
+			plural(len(doubled), "image", "images"), filepath.Base(finalPath))
+		for _, path := range doubled {
+			fmt.Printf("  - %s\n", path)
 		}
-		fmt.Printf("Warning: archive %s is ready and will be delivered, but %v\n",
-			filepath.Base(finalPath), err)
+	}
+	if len(stranded) > 0 {
+		fmt.Printf("Warning: archive %s will be uploaded, but %s could not be moved into the processed directory (%v):\n",
+			filepath.Base(finalPath), plural(len(stranded), "of its images", "of its images"), err)
+		if ac.stranded == nil {
+			ac.stranded = make(map[string]bool)
+		}
+		for _, path := range stranded {
+			fmt.Printf("  - %s\n", path)
+			ac.stranded[path] = true
+		}
+		fmt.Printf("  Move them there by hand, or they may be sent a second time or reported as an incomplete visit.\n")
 	}
 
 	return finalPath, nil
 }
+
+// allOfferedAgain reports whether every one of these images will be found by
+// the next scan: still in its camera folder, and not under its name in the
+// processed directory (an image whose name is there is skipped for good).
+// Only then may an archive of them be thrown away.
+func (ac *AstroCam) allOfferedAgain(paths []string) bool {
+	for _, path := range paths {
+		if _, err := os.Stat(path); err != nil {
+			return false
+		}
+		if _, err := os.Stat(filepath.Join(ac.config.ProcessedDirectory, filepath.Base(path))); err == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// syncFile makes sure that everything written to a file is on the disk. The
+// file is opened for writing because Windows flushes only through a handle
+// that may write.
+func syncFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+// errImagesNotMoved marks a set of images that was packed but could not be
+// moved into the processed directory at all. It gets its own standing problem,
+// because its cause and its cure differ from those of an archive that cannot
+// be built.
+var errImagesNotMoved = errors.New("none of the images could be moved into the processed directory")
 
 // verifyArchiveMembers checks that the archive holds exactly the expected
 // frames, each stored under its bare base name. The server requires bare names
@@ -1766,7 +1977,7 @@ func (ac *AstroCam) uploadFile(filePath, server string) error {
 			}
 			rate := float64(sent) / elapsed.Seconds()
 			needed := time.Duration(float64(prog.total) / rate * float64(time.Second))
-			return fmt.Errorf("%w: only %s of %s reached %s in %v (%s/s). The server is REACHABLE - the link is too slow: this archive needs about %v at that rate. Every retry starts again from the beginning, so it will keep failing until the link is faster, the archive is smaller, or uploadTimeout is raised",
+			return fmt.Errorf("%w: only %s of %s reached %s in %v (%s/s). The server is REACHABLE - the link is too slow: this archive needs about %v at that rate. Every retry starts again from the beginning, so it will keep failing until the link is faster",
 				errUploadTimeout, humanBytes(sent), humanBytes(prog.total), server,
 				elapsed.Round(time.Second), humanBytes(int64(rate)), needed.Round(time.Second))
 		}
@@ -1880,6 +2091,8 @@ func formatElapsedDuration(d time.Duration) string {
 const (
 	conditionDelivery = "delivery" // archives cannot be handed over to the server
 	conditionInput    = "input"    // images cannot be read from the camera directories
+	conditionPacking  = "packing"  // complete sets of images cannot be packed on this computer
+	conditionTransfer = "transfer" // uploads run out of time before the server has answered
 	conditionArchive  = "archive"  // one particular archive is being refused over and over
 )
 
@@ -1957,7 +2170,7 @@ func (ac *AstroCam) hasCondition(kind string) bool {
 func (ac *AstroCam) reportStatus() {
 	var others []*problemCondition
 	// Fixed order, so the same problem always appears in the same place.
-	for _, kind := range []string{conditionDelivery, conditionInput, conditionArchive} {
+	for _, kind := range []string{conditionDelivery, conditionInput, conditionPacking, conditionTransfer, conditionArchive} {
 		cond := ac.conditions[kind]
 		if cond == nil {
 			continue
@@ -2271,11 +2484,18 @@ func httpAnswerText(status, location, body string) string {
 // htmlTag matches one HTML tag.
 var htmlTag = regexp.MustCompile(`<[^>]*>`)
 
+// htmlNonText matches a style sheet or a script embedded in a page, up to its
+// closing tag or, when the answer was cut short at the read limit, to the end.
+// A proxy's error page can carry several kilobytes of CSS before its first
+// visible word, and that would otherwise be all the console gets to show.
+var htmlNonText = regexp.MustCompile(`(?is)<(?:style|script)\b.*?(?:</(?:style|script)\s*>|\z)`)
+
 // plainServerText makes a server response fit for the console. An error page
 // arrives as HTML, and its tags bury the one sentence that matters; the text
 // is also cut to a length that still leaves room for the rest of a banner.
 func plainServerText(body string) string {
-	text := html.UnescapeString(htmlTag.ReplaceAllString(body, " "))
+	text := htmlNonText.ReplaceAllString(body, " ")
+	text = html.UnescapeString(htmlTag.ReplaceAllString(text, " "))
 	text = strings.Join(strings.Fields(text), " ")
 	const limit = 600
 	if runes := []rune(text); len(runes) > limit {
@@ -2323,10 +2543,14 @@ func operatorAdviceFor(reason string) string {
 // raises a standing condition so the pause stays on screen for as long as it
 // lasts, instead of scrolling away after one line. fromStatusCheck says whether
 // the server's status check found the problem, or the answer to an upload did.
-// In test mode, a server-side rejection is fatal (exit immediately).
+// detail is the server's answer, already made plain text by plainServerText or
+// httpAnswerText; it is not cleaned a second time here, because text that the
+// page itself showed as "&lt;script" would then be taken for a script block
+// and cut off.
+// In test mode, every reason to pause is fatal (exit immediately).
 func (ac *AstroCam) pauseUploads(reason string, duration time.Duration, detail string, fromStatusCheck bool) {
 	if ac.testMode {
-		fmt.Printf("FATAL ERROR (Test Mode): %s\n", reason)
+		fmt.Print(testModeFatalText(reason, detail))
 		os.Exit(1)
 	}
 	ac.uploadPauseUntil = time.Now().Add(duration)
@@ -2336,11 +2560,25 @@ func (ac *AstroCam) pauseUploads(reason string, duration time.Duration, detail s
 	fmt.Printf("%s. Pausing uploads for %s, will retry after %s.\n",
 		reason, formatPauseDuration(duration), ac.uploadPauseUntil.Format("15:04:05"))
 	ac.setCondition(conditionDelivery, "ERROR", reason,
-		"Server response: "+plainServerText(detail),
+		"Server response: "+detail,
 		fmt.Sprintf("waiting %s before trying again, and packing new images in the meantime. %s",
 			formatPauseDuration(duration), operatorAdviceFor(reason)),
 		ac.uploadPauseUntil)
 	ac.conditions[conditionDelivery].fromStatusCheck = fromStatusCheck
+}
+
+// testModeFatalText is what a test run prints before it gives up on a server
+// that will not take uploads. The server's own words go with the reason: the
+// log of an automated run is read after the fact, and without them an upload
+// script that refuses (its answers carry UNMW_STATUS) cannot be told from a
+// proxy in front of it that cannot reach the script at all. detail is plain
+// text already, as for pauseUploads.
+func testModeFatalText(reason, detail string) string {
+	text := fmt.Sprintf("FATAL ERROR (Test Mode): %s\n", reason)
+	if response := strings.TrimSpace(detail); response != "" {
+		text += fmt.Sprintf("  Server response: %s\n", response)
+	}
+	return text
 }
 
 // isUploadPaused returns true if we are still within a pause window set after a
@@ -2434,7 +2672,7 @@ func (ac *AstroCam) pickServer(servers []string, from int) (string, int, bool) {
 			continue
 		case "error":
 			reason, pause := classifyServerError(answer.message)
-			ac.pauseUploads(reason, pause, answer.message, true)
+			ac.pauseUploads(reason, pause, plainServerText(answer.message), true)
 			return "", 0, false
 		case "http":
 			// The web server answered for the upload script, and what it said
@@ -2523,6 +2761,10 @@ func (ac *AstroCam) uploadPhase() {
 		return
 	}
 	if len(archives) == 0 {
+		// An upload that ran out of time can only be about an archive that is
+		// still waiting; with none left there is nothing that can time out.
+		ac.clearCondition(conditionTransfer, "no archive is waiting to be uploaded any more")
+
 		// Nothing to hand over. If the server was known to be in trouble, ask it
 		// how it is doing anyway: a standing error must be either confirmed or
 		// withdrawn, never left on the screen unchecked.
@@ -2580,6 +2822,7 @@ func (ac *AstroCam) uploadPhase() {
 			// delivery really works, so this is where a standing delivery
 			// problem is declared over.
 			ac.clearCondition(conditionDelivery, "an archive was delivered successfully")
+			ac.clearCondition(conditionTransfer, "an archive was delivered successfully")
 			if !ac.anyArchiveRefusedOften() {
 				ac.clearCondition(conditionArchive, "the archive that was being refused has been accepted")
 			}
@@ -2606,7 +2849,22 @@ func (ac *AstroCam) uploadPhase() {
 			fmt.Printf("The archive is kept and will be retried. Note that the server answered its\n")
 			fmt.Printf("preflight check moments ago, so this is a SLOW or STALLED TRANSFER, not an\n")
 			fmt.Printf("unreachable server.\n")
+			// The status line goes on saying "Server OK", which is true, so
+			// the transfer gets a problem of its own: otherwise the only sign
+			// of uploads that never finish is a queue that keeps growing.
+			ac.setCondition(conditionTransfer, "ERROR",
+				"Uploads do not finish within "+formatPauseDuration(uploadTimeout),
+				plainServerText(err.Error()),
+				"keeping the archive and trying it again; every try starts again from the "+
+					"beginning. Nothing is lost. If this goes on, the network link to the server "+
+					"is too slow or keeps stopping: check it.",
+				time.Time{})
 			return
+		}
+		if !errors.Is(err, errServerUnreachable) && !errors.Is(err, errLocalFailure) {
+			// The server got this archive and answered it, even if with a
+			// refusal: transfers finish again, and the refusal is handled below.
+			ac.clearCondition(conditionTransfer, "uploads reach the server and are answered again")
 		}
 
 		if errors.Is(err, errServerUnreachable) {
@@ -2625,7 +2883,7 @@ func (ac *AstroCam) uploadPhase() {
 		}
 		if uploadErrorIsServerRejection(err) {
 			reason, pause := classifyServerError(err.Error())
-			ac.pauseUploads(reason, pause, err.Error(), false)
+			ac.pauseUploads(reason, pause, plainServerText(err.Error()), false)
 			return
 		}
 
@@ -2785,6 +3043,9 @@ func (ac *AstroCam) makeJobForAreas() {
 	open := make(map[string]bool)
 	waiting, leftImages, leftFields, explained := 0, 0, 0, 0
 	hasNewFiles := false
+	packedAny := false
+	var packErr error
+	var packErrArea string
 
 	for _, area := range ac.areas {
 		// Packing one archive takes a moment; an operator who has asked the
@@ -2822,9 +3083,11 @@ func (ac *AstroCam) makeJobForAreas() {
 				archiveFile, err := ac.packVisit(area, visit)
 				if err != nil {
 					fmt.Printf("Error processing area %s: %v\n", area, err)
+					packErr, packErrArea = err, area
 				} else {
 					fmt.Printf("Archive created: %s\n", filepath.Base(archiveFile))
 					packed = true
+					packedAny = true
 					cands = framesNotIn(cands, visit)
 				}
 			}
@@ -2871,6 +3134,7 @@ func (ac *AstroCam) makeJobForAreas() {
 
 	ac.openFields = open
 	ac.waitingFields = waiting
+	ac.notePacking(packErrArea, packErr, packedAny, hasNewFiles)
 
 	// Incomplete sets that were already old when this run first saw them are
 	// summed up once. Listing them field by field would bury the screen in
@@ -2897,6 +3161,83 @@ func (ac *AstroCam) makeJobForAreas() {
 	if ac.testMode && hasNewFiles {
 		ac.testStartTime = time.Now() // Reset timeout when we find files
 	}
+}
+
+// notePacking keeps a standing problem on the screen while complete sets of
+// images cannot be packed. A set that fails is tried again on every cycle, so
+// the error line alone scrolled away and came back without ever standing out:
+// a full disk on this computer, or a processed folder that cannot be written
+// to, could stop every upload while the status lines looked calm.
+//
+// err is the last packing error of this cycle, packed says whether anything
+// was packed in it, and attempted whether a complete set was there to pack.
+func (ac *AstroCam) notePacking(area string, err error, packed, attempted bool) {
+	// Images left behind by a partial move are forgotten once a person (or a
+	// later archive) has taken them out of the camera folder, or once their
+	// name is in the processed folder, which keeps them from being sent again.
+	for path := range ac.stranded {
+		_, inCamera := os.Stat(path)
+		_, inProcessed := os.Stat(filepath.Join(ac.config.ProcessedDirectory, filepath.Base(path)))
+		if inCamera != nil || inProcessed == nil {
+			delete(ac.stranded, path)
+		}
+	}
+	if cond := ac.conditions[conditionPacking]; cond != nil && cond.reason == strandedReason &&
+		len(ac.stranded) == 0 && err == nil {
+		ac.clearCondition(conditionPacking, "those images are not in the camera folder any more")
+	}
+
+	switch {
+	case ac.stopping():
+		// Packing was cut short on purpose; nothing can be concluded from it.
+	case err != nil:
+		reason := "Images cannot be packed into archives"
+		action := "trying again every cycle. Nothing is lost: the images stay in the camera " +
+			"folder until an archive of them is complete. Check that the disk that holds " +
+			"the temp folder (" + ac.tempDirectory + ") is not full and can be written to."
+		if errors.Is(err, errImagesNotMoved) {
+			reason = "Packed images cannot be moved into the processed folder"
+			action = "trying again every cycle; nothing is uploaded from these images until " +
+				"they can be moved. Nothing is lost: they stay in the camera folder. Check that " +
+				"the processed folder (" + ac.config.ProcessedDirectory + ") exists, is not full " +
+				"and can be written to, and that no other program (an image viewer, a virus " +
+				"scanner) has the images open."
+		}
+		ac.setCondition(conditionPacking, "ERROR", reason,
+			fmt.Sprintf("Field %s: %v", area, err), action, time.Time{})
+	case len(ac.stranded) > 0:
+		ac.setCondition(conditionPacking, "WARNING", strandedReason,
+			strandedDetail(ac.stranded),
+			"uploading as usual. These images went out in an archive already: move them "+
+				"into the processed folder by hand, or they may be sent a second time or be "+
+				"reported as an incomplete visit. This warning ends when they are gone from "+
+				"the camera folder.",
+			time.Time{})
+	case packed:
+		ac.clearCondition(conditionPacking, "images are being packed again")
+	case !attempted:
+		ac.clearCondition(conditionPacking, "no complete set is waiting to be packed any more")
+	}
+}
+
+// strandedReason names the warning about images that were packed and uploaded
+// but could not be moved out of the camera folder.
+const strandedReason = "Uploaded images are still in the camera folder"
+
+// strandedDetail names the images left in the camera folder, the first few in
+// full and the rest counted.
+func strandedDetail(stranded map[string]bool) string {
+	paths := make([]string, 0, len(stranded))
+	for path := range stranded {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	const shown = 5
+	text := "Still in the camera folder: " + strings.Join(paths[:min(len(paths), shown)], ", ")
+	if len(paths) > shown {
+		text += fmt.Sprintf(" and %d more", len(paths)-shown)
+	}
+	return text
 }
 
 // reportScanSet says which folders are being watched, whenever that changes.
@@ -3088,17 +3429,20 @@ func (ac *AstroCam) run() {
 	fmt.Printf("  Camera directory: %s\n", ac.config.CameraDirectory)
 	fmt.Printf("  Processed directory: %s\n", ac.config.ProcessedDirectory)
 	fmt.Printf("  Temp directory: %s\n", ac.tempDirectory)
-	fmt.Printf("  Archive mode: %s\n", ac.config.ArchiveMode)
-
-	var archiveFormatDesc string
-	if ac.useRAR {
-		archiveFormatDesc = fmt.Sprintf("RAR (using %s)", ac.rarPath)
-	} else if ac.zipCompressed {
-		archiveFormatDesc = "ZIP compressed"
-	} else {
-		archiveFormatDesc = "ZIP uncompressed"
+	// Which archive format is used is nobody's concern unless SAI_ARCHIVE_MODE
+	// was set to force one: the server takes both, and the line that reports
+	// each archive names its format anyway.
+	if ac.config.ArchiveMode != "auto" {
+		var archiveFormatDesc string
+		if ac.useRAR {
+			archiveFormatDesc = fmt.Sprintf("RAR (using %s)", ac.rarPath)
+		} else if ac.zipCompressed {
+			archiveFormatDesc = "ZIP compressed"
+		} else {
+			archiveFormatDesc = "ZIP uncompressed"
+		}
+		fmt.Printf("  Archive format: %s (SAI_ARCHIVE_MODE=%s)\n", archiveFormatDesc, ac.config.ArchiveMode)
 	}
-	fmt.Printf("  Archive format: %s\n", archiveFormatDesc)
 	fmt.Printf("  FITS file extensions: .fts, .fits, .fit\n")
 
 	if ac.hasCredentials() {

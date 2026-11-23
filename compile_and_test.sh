@@ -27,7 +27,7 @@ echo "OK unit tests passed"
 # Build executables
 echo ""
 echo "Building astrocam-go for Linux..."
-go build -o astrocam-go
+CGO_ENABLED=0 go build -o astrocam-go
 if [ $? -ne 0 ]; then
     echo "ERROR: Linux build failed"
     exit 1
@@ -314,8 +314,9 @@ EOFCONFIG
     echo "$DISK_TEST_OUTPUT"
     echo ""
 
-    # Check that the output mentions disk space error
-    if echo "$DISK_TEST_OUTPUT" | grep -qi "disk space"; then
+    # Check astrocam-go's own verdict: the mock server's answer, which test mode
+    # also prints, says "disk space" whatever astrocam-go made of it
+    if echo "$DISK_TEST_OUTPUT" | grep -q "FATAL ERROR (Test Mode): Server is out of disk space"; then
         echo "   ✓ Disk space error correctly detected by astrocam-go"
         DISK_TEST_PASSED=true
     else

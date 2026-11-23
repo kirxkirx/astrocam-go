@@ -79,7 +79,7 @@ jobs:
 
       - name: Build Linux version
         run: |
-          go build -o astrocam-go
+          CGO_ENABLED=0 go build -o astrocam-go
           echo "✓ Linux build successful"
           ./astrocam-go -version || echo "Version info:"
 
@@ -249,7 +249,9 @@ jobs:
           DISK_OUTPUT=$(timeout 60s ./astrocam-go -test 2>&1) || true
           echo "$DISK_OUTPUT"
 
-          if echo "$DISK_OUTPUT" | grep -qi "disk space"; then
+          # The client's own verdict, not the words "disk space": test mode also
+          # prints the mock server's answer, and that says "disk space" anyway.
+          if echo "$DISK_OUTPUT" | grep -q "FATAL ERROR (Test Mode): Server is out of disk space"; then
             echo "✓ Disk space error correctly detected by astrocam-go"
           else
             echo "✗ Disk space error NOT detected"
@@ -573,7 +575,7 @@ jobs:
 
       - name: Build and run Linux integration test
         run: |
-          go build -o astrocam-go
+          CGO_ENABLED=0 go build -o astrocam-go
           if [ ! -f config.env ]; then
             echo "⚠ No config.env (no test server configured) - skipping"
             exit 0
@@ -586,23 +588,48 @@ jobs:
           # trigger heavy processing on the real server). Run for less than one
           # upload-throttle interval (120s) so the single attempt is not retried,
           # then assert connectivity from the captured output.
-          set +e
-          timeout 45 ./astrocam-go -test > integration_output.log 2>&1
-          set -e
-          echo "---- client output ----"
-          cat integration_output.log
-          echo "---- end of client output ----"
-          if ! grep -q "Using config file:" integration_output.log; then
-            echo "✗ Config file was not detected"
-            exit 1
-          fi
-          if grep -Eq "Successfully uploaded|Upload successful|UNMW_STATUS:OK|outside allowed range|UNMW_STATUS:ERROR|not confirmed by server" integration_output.log; then
-            echo "✓ Config detected and real server reached (connectivity OK)"
-          else
-            echo "✗ Did not reach the real server (no server response in output)"
-            exit 1
-          fi
-          echo "✓ Linux integration test completed successfully"
+          #
+          # The test server is reached through a proxy. When the proxy cannot
+          # reach the upload script it answers HTTP 5xx itself, without the
+          # script's UNMW_STATUS marker, and the client stops with "Server-side
+          # error (HTTP 5xx)" - or "server returned status 5xx" when it happens
+          # to the upload rather than to the status check before it. When
+          # nothing answers at all the client stops with "all upload servers
+          # are unreachable". These usually mean that the server side is down,
+          # not that astrocam-go is broken, so such a run is repeated before the
+          # job is failed. (A wrong TEST_SERVER_URL secret also ends up as
+          # "unreachable".) The archive packed by the first run stays in temp/
+          # and is what the next run uploads.
+          reached="Successfully uploaded|Upload successful|UNMW_STATUS:OK|outside allowed range|UNMW_STATUS:ERROR|not confirmed by server"
+          server_down="Server-side error \(HTTP 5[0-9][0-9]\)|server returned status 5[0-9][0-9]|all upload servers are unreachable"
+          attempts=3
+          for attempt in $(seq 1 $attempts); do
+            set +e
+            timeout 45 ./astrocam-go -test > integration_output.log 2>&1
+            set -e
+            echo "---- client output (attempt $attempt of $attempts) ----"
+            cat integration_output.log
+            echo "---- end of client output ----"
+            if ! grep -q "Using config file:" integration_output.log; then
+              echo "✗ Config file was not detected"
+              exit 1
+            fi
+            if grep -Eq "$reached" integration_output.log; then
+              echo "✓ Config detected and real server reached (connectivity OK)"
+              echo "✓ Linux integration test completed successfully"
+              exit 0
+            fi
+            if ! grep -Eq "$server_down" integration_output.log; then
+              echo "✗ Did not reach the upload script on the real server (see the client output above)"
+              exit 1
+            fi
+            if [ "$attempt" -lt "$attempts" ]; then
+              echo "⚠ No answer from the test server's upload script (see the client output above) - trying again in 60 s"
+              sleep 60
+            fi
+          done
+          echo "✗ No answer from the test server's upload script in $attempts attempts (see the client output above). Usually the server, or the proxy in front of it, is down: re-run the job once it answers again. If the client says the server is unreachable, also check the TEST_SERVER_URL secret."
+          exit 1
 
   integration-test-windows:
     runs-on: windows-latest
@@ -683,22 +710,37 @@ jobs:
           # verify config-file detection and connectivity, NOT a full successful
           # upload. Bounded single-attempt run (under the 120s upload throttle),
           # then assert connectivity from the captured output.
-          $p = Start-Process -FilePath ".\astrocam-go-win64.exe" -ArgumentList "-test" `
-                 -RedirectStandardOutput out.log -RedirectStandardError err.log -PassThru -NoNewWindow
-          if (-not $p.WaitForExit(45000)) { $p.Kill(); $p.WaitForExit() }
-          $out = ((Get-Content out.log -Raw -ErrorAction SilentlyContinue) + "`n" + `
-                  (Get-Content err.log -Raw -ErrorAction SilentlyContinue))
-          Write-Host "---- client output ----"
-          Write-Host $out
-          Write-Host "---- end of client output ----"
-          if ($out -notmatch "Using config file:") {
-            Write-Host "✗ Config file was not detected"
-            exit 1
+          # A run that only got as far as the proxy in front of the test server
+          # is repeated before the job fails - see the Linux job for why.
+          $reached = "Successfully uploaded|Upload successful|UNMW_STATUS:OK|outside allowed range|UNMW_STATUS:ERROR|not confirmed by server"
+          $serverDown = "Server-side error \(HTTP 5[0-9][0-9]\)|server returned status 5[0-9][0-9]|all upload servers are unreachable"
+          $attempts = 3
+          for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+            $p = Start-Process -FilePath ".\astrocam-go-win64.exe" -ArgumentList "-test" `
+                   -RedirectStandardOutput out.log -RedirectStandardError err.log -PassThru -NoNewWindow
+            if (-not $p.WaitForExit(45000)) { $p.Kill(); $p.WaitForExit() }
+            $out = ((Get-Content out.log -Raw -ErrorAction SilentlyContinue) + "`n" + `
+                    (Get-Content err.log -Raw -ErrorAction SilentlyContinue))
+            Write-Host "---- client output (attempt $attempt of $attempts) ----"
+            Write-Host $out
+            Write-Host "---- end of client output ----"
+            if ($out -notmatch "Using config file:") {
+              Write-Host "✗ Config file was not detected"
+              exit 1
+            }
+            if ($out -match $reached) {
+              Write-Host "✓ Config detected and real server reached (connectivity OK)"
+              Write-Host "✓ Windows integration test completed successfully"
+              exit 0
+            }
+            if ($out -notmatch $serverDown) {
+              Write-Host "✗ Did not reach the upload script on the real server (see the client output above)"
+              exit 1
+            }
+            if ($attempt -lt $attempts) {
+              Write-Host "⚠ No answer from the test server's upload script (see the client output above) - trying again in 60 s"
+              Start-Sleep -Seconds 60
+            }
           }
-          if ($out -match "Successfully uploaded|Upload successful|UNMW_STATUS:OK|outside allowed range|UNMW_STATUS:ERROR|not confirmed by server") {
-            Write-Host "✓ Config detected and real server reached (connectivity OK)"
-          } else {
-            Write-Host "✗ Did not reach the real server (no server response in output)"
-            exit 1
-          }
-          Write-Host "✓ Windows integration test completed successfully"
+          Write-Host "✗ No answer from the test server's upload script in $attempts attempts (see the client output above). Usually the server, or the proxy in front of it, is down: re-run the job once it answers again. If the client says the server is unreachable, also check the TEST_SERVER_URL secret."
+          exit 1

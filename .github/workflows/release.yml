@@ -29,7 +29,9 @@ jobs:
 
       - name: Build Linux binary
         run: |
-          go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-go
+          # No cgo: the program then needs no C library of a particular version and
+          # runs on old Linux systems as well as on new ones.
+          CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o astrocam-go
           chmod +x astrocam-go
 
       - name: Build Windows 64-bit binary
@@ -67,77 +69,140 @@ jobs:
           # Create installation scripts
           cat > astrocam-${{ steps.version.outputs.version }}/install-linux.sh << 'EOF'
           #!/bin/bash
+          # Installs astrocam-go into /opt/astrocam, or upgrades the program there.
+          # An existing config.env and areas.txt are kept.
+          set -e
+          cd "$(dirname "$0")"
+
+          case "$(uname -m)" in
+            x86_64) ;;
+            *) echo "This package holds astrocam-go for 64-bit PCs (x86-64) only; this computer is $(uname -m)." >&2
+               exit 1 ;;
+          esac
           echo "Installing AstroCam for Linux..."
-          
-          # Create installation directory
+
+          # The program keeps its temp folder and lock file next to itself, so the
+          # folder belongs to the user who runs it, not to root. An upgrade keeps the
+          # owner the folder already has, unless that is root (older install scripts
+          # left everything to root).
+          OWNER="${SUDO_USER:-$(id -un)}"
+          if sudo test -d /opt/astrocam/ && [ "$(sudo stat -c %u /opt/astrocam/)" != 0 ]; then
+            OWNER="$(sudo stat -c %U /opt/astrocam/)"
+          fi
           sudo mkdir -p /opt/astrocam
-          echo "✓ Created /opt/astrocam directory"
-          
-          # Copy files with verbose output
-          echo "Copying executable..."
-          sudo cp -v astrocam-go /opt/astrocam/astrocam
-          sudo chmod +x /opt/astrocam/astrocam
-          
-          echo "Copying configuration files..."
-          sudo cp -v config.env.example /opt/astrocam/config.env
-          sudo cp -v areas.txt /opt/astrocam/
-          sudo cp -v README.md /opt/astrocam/ 2>/dev/null || echo "README.md not found, skipping"
-          
+
+          # The new program goes in under a new name and then takes the place of the
+          # old one, which works even while the old one is still running.
+          sudo cp astrocam-go /opt/astrocam/astrocam.new
+          sudo chmod 755 /opt/astrocam/astrocam.new
+          sudo mv -f /opt/astrocam/astrocam.new /opt/astrocam/astrocam
+          echo "Installed the program: /opt/astrocam/astrocam"
+
+          if sudo test -e /opt/astrocam/config.env; then
+            echo "Kept the existing /opt/astrocam/config.env"
+          else
+            sudo cp config.env.example /opt/astrocam/config.env
+            echo "Installed the example config.env - fill it in"
+          fi
+          if sudo test -e /opt/astrocam/areas.txt; then
+            echo "Kept the existing /opt/astrocam/areas.txt"
+          else
+            sudo cp areas.txt /opt/astrocam/areas.txt
+            echo "Installed the example areas.txt - replace it with your field names"
+          fi
+          sudo cp README.md /opt/astrocam/README.md
+          sudo chown -R "$OWNER": /opt/astrocam/
+
           echo ""
-          echo "========================================="
-          echo "✓ AstroCam installed successfully!"
-          echo "========================================="
-          echo "Installation location: /opt/astrocam/"
+          echo "AstroCam is installed in /opt/astrocam."
           echo ""
-          echo "Next steps:"
-          echo "1. Edit configuration: sudo nano /opt/astrocam/config.env"
-          echo "2. Edit sky areas: sudo nano /opt/astrocam/areas.txt"
-          echo "3. Test installation: cd /opt/astrocam && sudo ./astrocam -test"
-          echo "4. Run normally: cd /opt/astrocam && sudo ./astrocam"
+          echo "Next steps for a first installation:"
+          echo "1. Fill in config.env - upload address, login, camera tag (SAI_POSTFIX),"
+          echo "   images per visit (SAI_COUNT) and folders: nano /opt/astrocam/config.env"
+          echo "2. Put your field names into: nano /opt/astrocam/areas.txt"
+          echo "3. Make the camera software name the images as README.md says."
+          echo "4. Start it as $OWNER: cd /opt/astrocam && ./astrocam"
           echo ""
-          echo "Config files are automatically found next to the executable!"
-          echo "No need to copy config files to working directory."
+          echo "After an upgrade, stop the running astrocam with Ctrl+C and start it again."
           EOF
-          
+
           cat > astrocam-${{ steps.version.outputs.version }}/install-windows.bat << 'EOF'
           @echo off
+          rem Installs astrocam-go into C:\AstroCam, or upgrades the program there.
+          rem An existing config.env and areas.txt are kept.
+          rem The package files are taken from the folder of this script, whatever folder
+          rem Windows starts it in ("Run as administrator" starts it in System32).
+          pushd "%~dp0" || goto nofiles
           echo Installing AstroCam for Windows...
           echo.
-          
-          REM Create installation directory
-          if not exist "C:\AstroCam" (
-              mkdir "C:\AstroCam"
-              echo Created C:\AstroCam directory
+
+          rem The 32-bit program on 32-bit Windows and on Windows on ARM (which runs
+          rem 32-bit programs for x86 everywhere), the 64-bit one everywhere else.
+          set "EXE=astrocam-go-win64.exe"
+          if /i "%PROCESSOR_ARCHITECTURE%"=="x86" if not defined PROCESSOR_ARCHITEW6432 set "EXE=astrocam-go-win32.exe"
+          if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "EXE=astrocam-go-win32.exe"
+          if /i "%PROCESSOR_ARCHITEW6432%"=="ARM64" set "EXE=astrocam-go-win32.exe"
+          if not exist "%EXE%" goto nofiles
+          if not exist "config.env.example" goto nofiles
+          if not exist "areas.txt" goto nofiles
+
+          if not exist "C:\AstroCam\" (
+              mkdir "C:\AstroCam" || goto failed
           )
-          
-          REM Copy files
-          echo Copying files...
-          copy /v astrocam-go-win64.exe "C:\AstroCam\astrocam.exe"
-          copy /v config.env.example "C:\AstroCam\config.env"
-          copy /v areas.txt "C:\AstroCam\"
-          copy /v README.md "C:\AstroCam\" 2>nul
-          
+          copy /y "%EXE%" "C:\AstroCam\astrocam.exe" >nul || goto failed
+          echo Installed the program: C:\AstroCam\astrocam.exe
+
+          if exist "C:\AstroCam\config.env" (
+              echo Kept the existing C:\AstroCam\config.env
+          ) else (
+              copy "config.env.example" "C:\AstroCam\config.env" >nul || goto failed
+              echo Installed the example config.env - fill it in
+          )
+          if exist "C:\AstroCam\areas.txt" (
+              echo Kept the existing C:\AstroCam\areas.txt
+          ) else (
+              copy "areas.txt" "C:\AstroCam\areas.txt" >nul || goto failed
+              echo Installed the example areas.txt - replace it with your field names
+          )
+          copy /y "README.md" "C:\AstroCam\README.md" >nul
+
           echo.
-          echo =========================================
-          echo ^✓ AstroCam installed successfully!
-          echo =========================================
-          echo Installation location: C:\AstroCam\
+          echo AstroCam is installed in C:\AstroCam
           echo.
-          echo Next steps:
-          echo 1. Edit configuration: notepad C:\AstroCam\config.env
-          echo 2. Edit sky areas: notepad C:\AstroCam\areas.txt
-          echo 3. Test installation: cd C:\AstroCam ^&^& astrocam.exe -test
-          echo 4. Run normally: cd C:\AstroCam ^&^& astrocam.exe
+          echo Next steps for a first installation:
+          echo 1. Fill in config.env - upload address, login, camera tag (SAI_POSTFIX),
+          echo    images per visit (SAI_COUNT) and folders: notepad C:\AstroCam\config.env
+          echo 2. Put your field names into: notepad C:\AstroCam\areas.txt
+          echo 3. Make NINA name the images as README.md says (section NINA).
+          echo 4. Start it: C:\AstroCam\astrocam.exe
           echo.
-          echo Config files are automatically found next to the executable!
-          echo No need to copy config files to working directory.
+          echo After an upgrade, start C:\AstroCam\astrocam.exe again.
           echo.
-          echo IMPORTANT: Windows QuickEdit mode is automatically disabled
-          echo to prevent program freezing when text is selected in console.
+          popd
+          pause
+          exit /b 0
+
+          :failed
+          echo.
+          echo INSTALLATION FAILED: a file could not be copied (see the message above).
+          echo If astrocam.exe is running, stop it with Ctrl+C and run this script again.
+          echo.
+          popd
+          pause
+          exit /b 1
+
+          :nofiles
+          echo.
+          echo INSTALLATION FAILED: the files of the package are not next to this script.
+          echo Unpack the whole zip file into a folder (Extract all) and run
+          echo install-windows.bat from that folder.
           echo.
           pause
+          exit /b 1
           EOF
-          
+          # cmd.exe needs Windows line endings to find the labels of a batch file.
+          sed -i 's/$/\r/' astrocam-${{ steps.version.outputs.version }}/install-windows.bat
+
           chmod +x astrocam-${{ steps.version.outputs.version }}/install-linux.sh
           
           # Create complete release archive
@@ -149,166 +214,45 @@ jobs:
         run: |
           cat > release_notes.md << EOF
           # AstroCam ${{ steps.version.outputs.version }}
-          
-          ## 🚀 Key Features
-          
-          ### ✅ **Intelligent Configuration Management**
-          - **Smart Config Lookup**: Automatically finds config files next to executable, then falls back to current directory
-          - **Flexible Deployment**: No need to copy config files to working directory
-          - **Cross-Platform Paths**: Handles Windows/Linux path differences automatically
-          
-          ### ✅ **Windows Console Stability**
-          - **QuickEdit Mode Protection**: Automatically disables Windows QuickEdit mode on startup
-          - **No More Freezing**: Program won't freeze when text is selected in console
-          - **Smart Detection**: Gracefully handles Windows Terminal, Git Bash, and other non-standard consoles
-          - **Cross-Platform Safe**: Unix/Linux systems unaffected (function is no-op)
-          
-          ### ✅ **Automatic Archive Format Detection**
-          - **RAR Format**: Uses external \`rar\` command when available (better compression)
-          - **ZIP Fallback**: Built-in ZIP support when RAR unavailable (no dependencies)
-          - **Runtime Detection**: Automatically chooses best available format at startup
-          
-          ### ✅ **Robust Operation Modes**
-          - **Production Mode**: Continuous monitoring with graceful error handling
-          - **Test Mode**: Automated testing with 2-minute timeout for CI/CD pipelines
-          - **Upload Throttling**: 120-second delays between uploads to prevent server overload
-          
-          ### ✅ **Enhanced Authentication & Security**
-          - **Flexible Auth**: Works with or without credentials (handles empty username/password)
-          - **HTTP Basic Auth**: Secure authentication when credentials provided
-          - **Credential Detection**: Automatically detects and handles whitespace-only credentials
-          
-          ## 📦 Download Options
-          
-          ### Individual Binaries
-          - **Linux (64-bit)**: \`astrocam-go\`
-          - **Windows (64-bit)**: \`astrocam-go-win64.exe\` (recommended for modern Windows)
-          - **Windows (32-bit)**: \`astrocam-go-win32.exe\` (for legacy Windows systems)
-          
-          ### Complete Packages (Recommended)
-          - **All platforms**: \`astrocam-${{ steps.version.outputs.version }}-complete.tar.gz\` or \`astrocam-${{ steps.version.outputs.version }}-complete.zip\`
-          - Includes all binaries, configuration templates, and automated installation scripts
-          - Ready-to-deploy with verbose installation feedback
-          
-          ## 🔧 Quick Start
-          
-          ### Linux Installation
-          \`\`\`bash
-          # Option 1: Complete package (recommended)
-          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/astrocam-${{ steps.version.outputs.version }}-complete.tar.gz
-          tar -xzf astrocam-${{ steps.version.outputs.version }}-complete.tar.gz
-          cd astrocam-${{ steps.version.outputs.version }}
-          ./install-linux.sh
-          
-          # Option 2: Individual binary
-          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/astrocam-go
-          chmod +x astrocam-go
-          ./astrocam-go -version
+
+          astrocam-go runs on the computer that controls a telescope camera. It packs the images of each visit to a sky field into one archive and uploads it to the transient search of the New Milky Way (NMW) survey while the night is still going on. The [README](https://github.com/${{ github.repository }}#readme) explains what it does, how to set it up and what its console messages mean.
+
+          ## Which file to download
+
+          - \`astrocam-go-win64.exe\` - Windows 10 or newer, 64-bit
+          - \`astrocam-go-win32.exe\` - Windows 10 or newer, 32-bit, and Windows on ARM
+          - \`astrocam-go\` - Linux on a 64-bit PC (x86-64)
+          - \`astrocam-${{ steps.version.outputs.version }}-complete.zip\` or \`.tar.gz\` - all three programs, together with \`config.env.example\`, \`areas.txt\`, \`README.md\` and install scripts
+
+          ## Upgrading
+
+          1. Stop astrocam-go with Ctrl+C in its window.
+          2. Replace the program file with the new one, under the name the computer starts it by. If it was installed with an install script, run the install script of the new release instead: it replaces the program and keeps \`config.env\` and \`areas.txt\`.
+          3. Start it again. It prints \`Version: ${{ steps.version.outputs.version }}\` at startup.
+
+          Keep \`config.env\`, \`areas.txt\` and the \`temp\` folder: \`temp\` may hold archives that have not been uploaded yet, and they are sent after the restart.
+
+          ## First installation
+
+          Put the program, a \`config.env\` made from \`config.env.example\`, and an \`areas.txt\` with your field names into one folder that the user running the program can write to, for example \`C:\\AstroCam\`, and start the program. On Linux, make the program executable first: \`chmod +x astrocam-go\`. Or unpack a complete package and run \`install-windows.bat\` (double-click it) or \`./install-linux.sh\` (it asks for the sudo password): they copy the program and the example \`config.env\` and \`areas.txt\` into \`C:\\AstroCam\` or \`/opt/astrocam\`, keeping these two files if they are there already. Then fill in both files and start the program. The README says what goes into \`config.env\` and \`areas.txt\`, what to ask the server administrator for, and how NINA has to name the images.
+
+          ## Changes
+
+          The commits up to this release: https://github.com/${{ github.repository }}/commits/${{ steps.version.outputs.version }}
+
+          ## Checking the download
+
+          \`checksums.txt\` holds the SHA-256 checksums of the three programs. On Linux:
+
           \`\`\`
-          
-          ### Windows Installation
-          1. Download \`astrocam-${{ steps.version.outputs.version }}-complete.zip\`
-          2. Extract to a folder
-          3. Run \`install-windows.bat\` as Administrator
-          4. Edit \`C:\\AstroCam\\config.env\` with your settings
-          5. Run \`C:\\AstroCam\\astrocam.exe -test\` to verify
-          
-          **Windows Note**: QuickEdit mode is automatically disabled on startup to prevent console freezing!
-          
-          ## ⚙️ Configuration
-          
-          ### Smart Config File Location
-          AstroCam now automatically finds configuration files in this order:
-          1. **Next to executable** (preferred for deployed installations)
-          2. **Current working directory** (fallback for development)
-          
-          ### Setup Steps
-          1. Copy \`config.env.example\` to \`config.env\`
-          2. Edit server URL, credentials, and directories
-          3. Ensure \`areas.txt\` contains your sky field prefixes
-          4. Test with: \`./astrocam-go -test\`
-          
-          ### Example Configuration
-          \`\`\`bash
-          SAI_SERVER=https://your-server.com/upload.py
-          SAI_USERNAME=your_username      # Optional: leave empty for no auth
-          SAI_PASSWORD=your_password      # Optional: leave empty for no auth
-          SAI_CAMERA_DIRECTORY=/path/to/camera/images
-          SAI_PROCESSED_DIRECTORY=/path/to/processed/images
-          SAI_INTERVAL=10                 # Scan interval in seconds
-          SAI_COUNT=3                     # Files per archive
+          sha256sum --ignore-missing -c checksums.txt
           \`\`\`
-          
-          ## 🔍 Archive Formats & Dependencies
-          
-          ### RAR (Preferred)
-          - **Windows**: Install WinRAR (includes command line tools)
-          - **Linux**: \`sudo apt install rar\` or \`sudo yum install rar\`
-          - **Benefits**: Better compression, same format as original Python version
-          
-          ### ZIP (Universal Fallback)
-          - **No Dependencies**: Built into Go executable
-          - **Cross-Platform**: Works everywhere without additional software
-          - **Automatic**: Used when \`rar\` command not detected
-          
-          ## ✅ Verification & Testing
-          
-          ### Verify Download Integrity
-          \`\`\`bash
-          # Download checksums file
-          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/checksums.txt
-          
-          # Verify binaries
-          sha256sum -c checksums.txt
-          \`\`\`
-          
-          ### Test Your Installation
-          \`\`\`bash
-          # Quick test (exits after 2 minutes if no files)
-          ./astrocam-go -test
-          
-          # Show version
-          ./astrocam-go -version
-          
-          # Normal operation
-          ./astrocam-go
-          \`\`\`
-          
-          ### Windows Console Notes
-          On Windows, you'll see:
-          \`\`\`
-          Windows QuickEdit mode disabled (text selection will not freeze the program)
-          \`\`\`
-          This is normal and ensures stable operation. The program automatically disables QuickEdit mode to prevent freezing when text is selected.
-          
-          ## 🔄 Migration from Python Version
-          
-          1. **Stop** the Python astrocam service
-          2. **Backup** your current \`config.env\` and \`areas.txt\`
-          3. **Install** Go version using complete package
-          4. **Copy** your config files to installation directory
-          5. **Test** with \`./astrocam-go -test\`
-          6. **Deploy** and remove Python version
-          
-          The Go version is a **drop-in replacement** with improved reliability and performance.
-          
-          ## 🚨 Troubleshooting
-          
-          ### Common Issues
-          - **"rar command not found"**: System automatically uses ZIP format
-          - **HTTP 401/403 errors**: Check username/password in config.env
-          - **File move errors**: System retries automatically, then continues
-          - **Test timeout**: Normal behavior when no files present in test mode
-          - **Windows console freezing**: Fixed automatically - program disables QuickEdit mode on startup
-          
-          ### Getting Help
-          - Check the complete README.md in the package
-          - Review configuration examples
-          - Run with \`-test\` flag for validation
-          
-          ---
-          
-          **Full Documentation**: [Repository README](https://github.com/${{ github.repository }}) | **Issues**: [Report Bugs](https://github.com/${{ github.repository }}/issues)
+
+          On Windows, compare the output of \`certutil -hashfile astrocam-go-win64.exe SHA256\` with the line for that file in \`checksums.txt\`.
+
+          ## Problems
+
+          Faults in astrocam-go itself: https://github.com/${{ github.repository }}/issues
           EOF
           
           echo "release_notes<<EOF" >> $GITHUB_OUTPUT

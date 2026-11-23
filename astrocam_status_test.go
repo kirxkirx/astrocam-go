@@ -365,6 +365,58 @@ func TestPlainServerText(t *testing.T) {
 	}
 }
 
+// A proxy in front of the upload script answers with a page of its own when it
+// cannot reach the script. Privoxy's comes with kilobytes of CSS ahead of its
+// first visible word, and the 4 kB read limit cuts it off inside the style
+// sheet; the console has to show the title, not the CSS.
+func TestPlainServerTextSkipsStyleSheets(t *testing.T) {
+	privoxy := `<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+<html>
+<head>
+  <title>503 - Forwarding failure (Privoxy@localhost)</title>
+  <meta http-equiv="Content-Style-Type" content="text/css">
+  <style type="text/css">
+/*
+ * CSS for Privoxy CGI and script output
+ */
+body,td,th { font-family: arial, helvetica, helv, sans-serif; }
+` + strings.Repeat("td.box { border: solid black 1px; }\n", 100)
+	if got, want := plainServerText(privoxy), "503 - Forwarding failure (Privoxy@localhost)"; got != want {
+		t.Errorf("a page cut off inside its style sheet: got %q, want %q", got, want)
+	}
+
+	page := "<html><head><title>502 Proxy Error</title><STYLE>p { color: red }</STYLE>" +
+		"<script>var x = 1;</script></head><body><p>The proxy server received an invalid response.</p></body></html>"
+	if got, want := plainServerText(page), "502 Proxy Error The proxy server received an invalid response."; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// A test run stops at the first answer that will not let it upload, and the
+// log of a CI run is all there is to go on afterwards. The server's own words
+// have to be in it: "Server-side error (HTTP 503)" alone does not say whether
+// the upload script refused or a proxy in front of it could not reach it.
+func TestTestModeFatalTextCarriesTheServerResponse(t *testing.T) {
+	got := testModeFatalText("Server-side error (HTTP 503)",
+		httpAnswerText("503 Service Unavailable", "", "<html><head><title>503 - Forwarding failure (Privoxy@localhost)</title></head></html>"))
+	want := "FATAL ERROR (Test Mode): Server-side error (HTTP 503)\n" +
+		"  Server response: HTTP 503 Service Unavailable. 503 - Forwarding failure (Privoxy@localhost)\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+
+	// The upload script's own refusal carries its UNMW_STATUS marker, which is
+	// how the CI integration test knows that the real server was reached.
+	got = testModeFatalText("Server is busy: system load too high", "UNMW_STATUS:ERROR system load too high: 63.2\n")
+	if !strings.Contains(got, "  Server response: UNMW_STATUS:ERROR system load too high: 63.2\n") {
+		t.Errorf("the server's answer is missing: %q", got)
+	}
+
+	if got := testModeFatalText("Server-side error (HTTP 502)", ""); got != "FATAL ERROR (Test Mode): Server-side error (HTTP 502)\n" {
+		t.Errorf("an empty answer must not add a line: %q", got)
+	}
+}
+
 // The bug this guards against lost data without a trace: an upload answered
 // with a redirect was repeated by the HTTP client as a GET without the
 // archive, the server's status check answered that GET with UNMW_STATUS:OK,
@@ -519,6 +571,26 @@ func TestGatewayErrorIsAServerProblem(t *testing.T) {
 	}
 	if ac.hasCondition(conditionArchive) {
 		t.Errorf("the gateway error was blamed on the archive")
+	}
+}
+
+// An error page can show markup as text, such as a filter that quotes the
+// "<script>" it objected to. Once the page is plain text, that is just words:
+// cleaning it a second time would take it for the start of a script and drop
+// everything after it from the banner.
+func TestServerTextIsCleanedOnlyOnce(t *testing.T) {
+	page := "<html><body><p>Bad header: &lt;script&gt; seen in the upstream reply; check the backend</p></body></html>"
+	_, ac := startServer(t, say(502, page), say(502, page))
+	queueArchive(t, ac, "2026-11-23_Field_010203.zip")
+
+	captureStdout(t, ac.uploadPhase)
+
+	cond := ac.conditions[conditionDelivery]
+	if cond == nil {
+		t.Fatalf("want a standing server problem")
+	}
+	if !strings.Contains(cond.detail, "Bad header: <script> seen in the upstream reply; check the backend") {
+		t.Errorf("the server's words were cut short: %q", cond.detail)
 	}
 }
 
