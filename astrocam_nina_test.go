@@ -243,13 +243,23 @@ func TestCollectCandidatesWaitsForAStableFile(t *testing.T) {
 	ac := testCam(t, &Config{CameraDirectory: dir, ProcessedDirectory: processed, Count: 2}, []string{"Cep-01"})
 
 	stamps := make(map[string]fileStamp)
-	if got := ac.collectCandidates(dir, stamps); len(got["Cep-01"]) != 0 {
+	first := ac.scanDir(dir, stamps)
+	if len(first.ready["Cep-01"]) != 0 {
 		t.Fatalf("a file was accepted on the cycle it first appeared")
+	}
+	// It is not ready, but it is not invisible either: the status lines count
+	// on hearing about an image the moment the camera starts writing it.
+	if len(first.pending) != 1 || first.pending[0].area != "Cep-01" {
+		t.Errorf("the new file was not reported as pending: %+v", first.pending)
 	}
 	ac.stamps = stamps
 
-	if got := ac.collectCandidates(dir, make(map[string]fileStamp)); len(got["Cep-01"]) != 1 {
+	second := ac.scanDir(dir, make(map[string]fileStamp))
+	if len(second.ready["Cep-01"]) != 1 {
 		t.Fatalf("an unchanged file was not accepted on the next cycle")
+	}
+	if len(second.pending) != 0 {
+		t.Errorf("a ready file is still listed as pending: %+v", second.pending)
 	}
 }
 
@@ -264,10 +274,10 @@ func TestCollectCandidatesSkipsAlreadyProcessed(t *testing.T) {
 
 	ac := testCam(t, &Config{CameraDirectory: dir, ProcessedDirectory: processed, Count: 2}, []string{"Cep-01"})
 	stamps := make(map[string]fileStamp)
-	ac.collectCandidates(dir, stamps)
+	ac.scanDir(dir, stamps)
 	ac.stamps = stamps
 
-	if got := ac.collectCandidates(dir, make(map[string]fileStamp)); len(got["Cep-01"]) != 0 {
+	if got := ac.scanDir(dir, make(map[string]fileStamp)); len(got.ready["Cep-01"]) != 0 {
 		t.Errorf("a frame already in the processed directory was offered for packing")
 	}
 }
@@ -715,21 +725,21 @@ func TestConditionIsRepeatedEveryCycle(t *testing.T) {
 		ac.setCondition(conditionDelivery, "ERROR", "Server is out of disk space",
 			"Server response: no space left on device",
 			"waiting 1 hour before trying again", time.Now().Add(time.Hour))
-		// The first cycle prints the full banner, later ones a reminder line,
-		// but every single cycle has to say something.
+		// The first cycle prints the full banner as well, but the status lines
+		// of every single cycle have to name the problem.
 		for i := 0; i < 4; i++ {
-			ac.reportConditions()
+			ac.reportStatus()
 		}
 	})
 
-	if n := strings.Count(out, "Server is out of disk space"); n != 4 {
-		t.Errorf("the standing problem was named %d times in 4 cycles, want 4:\n%s", n, out)
+	if n := strings.Count(out, "!!! SERVER IS OUT OF DISK SPACE for 0s. Next try at "); n != 4 {
+		t.Errorf("the status lines named the standing problem %d times in 4 cycles, want 4:\n%s", n, out)
 	}
-	if !strings.Contains(out, "!!! ERROR: Server is out of disk space") {
-		t.Errorf("no full banner on the first cycle:\n%s", out)
+	if n := strings.Count(out, "!!! ERROR: Server is out of disk space"); n != 1 {
+		t.Errorf("the full banner was printed %d times in 4 cycles, want once, on the first:\n%s", n, out)
 	}
-	if !strings.Contains(out, "!!! ERROR 0s: Server is out of disk space, 3 waiting") {
-		t.Errorf("no per-cycle reminder after the banner:\n%s", out)
+	if n := strings.Count(out, "3 archives queued"); n != 4 {
+		t.Errorf("the size of the queue was shown %d times in 4 cycles, want 4:\n%s", n, out)
 	}
 	if !strings.Contains(out, "oldest is old.zip") {
 		t.Errorf("the queue summary is missing, so the operator cannot see how much is stuck:\n%s", out)

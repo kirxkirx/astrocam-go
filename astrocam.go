@@ -4,19 +4,23 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -79,7 +83,37 @@ const (
 
 	// How often the upload prints how far it has got.
 	uploadProgressInterval = 20 * time.Second
+
+	// uploadThrottleDelay is the shortest time between the starts of two
+	// uploads. Every upload starts a processing run on the server, so they are
+	// spaced out rather than sent back to back.
+	uploadThrottleDelay = 120 * time.Second
+
+	// recentFileWindow is how far back a FITS file that matches no field is
+	// still worth mentioning. While the camera software is naming its images
+	// in a way this program cannot use, such files keep arriving and the note
+	// about them stays on screen; an hour after the naming has been put right,
+	// or after a few frames of some other target, it goes away by itself.
+	recentFileWindow = time.Hour
+
+	// consoleWidth is the longest line the status report prints. The telescope
+	// machines run an 80 column console, and a line that reaches the last
+	// column wraps and leaves an empty row behind it.
+	consoleWidth = 79
+
+	// statusIndent starts every status line after the first. It is as wide as
+	// the time of day that starts the first one, so the text lines up.
+	statusIndent = "         "
 )
+
+// errStopping marks an operation that was abandoned because the operator asked
+// the program to stop. Nothing is wrong with the archive or with the server.
+var errStopping = errors.New("stop requested")
+
+// errLocalFailure marks an upload that failed before anything was sent,
+// because the archive could not be read from this computer's disk. The server
+// has not seen the archive, and must not be said to have refused it.
+var errLocalFailure = errors.New("could not read the archive")
 
 // errServerUnreachable marks a preflight/upload failure caused by the server
 // being unreachable at the network level (DNS failure, timeout, connection
@@ -128,11 +162,32 @@ type AstroCam struct {
 	areaPatterns     []*regexp.Regexp             // one compiled matcher per areas entry, same order
 	stamps           map[string]fileStamp         // size and mtime of each candidate on the previous cycle
 	rejects          map[string]int               // per-archive count of server content rejections
-	noVisit          map[string]int               // per-area frame count already reported as "no single visit"
+	firstRefusal     map[string]time.Time         // when each archive still waiting was first refused
 	lastScanSet      string                       // last scan set printed, so it is logged only when it changes
 	conditions       map[string]*problemCondition // standing problems, by kind; empty when all is well
 	queueSummary     string                       // one-line description of what is waiting to be delivered
-	queuedCount      int                          // how many archives are waiting, for the short reminder line
+	queuedCount      int                          // how many archives are waiting, for the status lines
+	queuedBytes      int64                        // their total size
+
+	// Everything below feeds the status lines printed at the end of each cycle.
+	// The zero value of each field means "nothing known yet", so an AstroCam
+	// built by hand in a test needs none of it set.
+	ctx            context.Context // cancelled when the operator asks the program to stop
+	label          string          // release tag or build id of this binary
+	cycle          int             // scan cycles started so far, for pacing repeated notes
+	uploadedCount  int             // archives the server has confirmed during this run
+	lastUploadOK   time.Time       // when the most recent of them was confirmed
+	serverAskedAt  time.Time       // when a server last answered at all, whatever it said
+	serverOKAt     time.Time       // when a server last said it is taking uploads
+	serverOKName   string          // what to call that server; empty means "Server"
+	serverWarning  string          // the server's own warning in a few words; empty when none
+	lastImageAt    time.Time       // modification time of the newest field image any scan has seen
+	waitingFields  int             // fields that have some, but not yet all, images of a set
+	openFields     map[string]bool // fields that had new images within visitGap on the previous scan
+	leftoversTold  bool            // the summary of old incomplete sets has been printed
+	strayCount     int             // recent FITS files that match no field in areas.txt
+	strayTold      int             // how many there were when they were last explained
+	strayToldCycle int             // the cycle in which they were last explained
 }
 
 // problemCondition is a fault that outlasts the moment it happened - the server
@@ -157,6 +212,12 @@ type problemCondition struct {
 	since    time.Time // when it was first seen
 	until    time.Time // when a timed pause expires; zero if not time-based
 	cycles   int       // how many scan cycles it has lasted
+
+	// fromStatusCheck is set when the server's status check (the preflight)
+	// raised the problem. Such a problem is over as soon as that same check
+	// comes back clean. A problem raised by the answer to an upload is not: the
+	// status check may pass while every upload is still turned away.
+	fromStatusCheck bool
 }
 
 type FileGroup struct {
@@ -345,6 +406,11 @@ func findRARExecutable() (string, bool) {
 // and .FITS; the area name in front of it stays case-sensitive.
 const fitsExtensionPattern = `\.(?i:fts|fits|fit)`
 
+// fitsNamePattern matches any file name with a FITS extension, whatever comes
+// before it. It is what tells an image that belongs to no field apart from the
+// other things an imaging program leaves in its folders.
+var fitsNamePattern = regexp.MustCompile(fitsExtensionPattern + `$`)
+
 // determineArchiveSettings determines archive format based on config and availability
 func determineArchiveSettings(config *Config) (useRAR bool, zipCompressed bool, archiveExt string, rarPath string) {
 	rarPath, rarAvailable := findRARExecutable()
@@ -413,6 +479,7 @@ func NewAstroCam(testMode bool) (*AstroCam, error) {
 	}
 
 	fmt.Printf("=== ASTROCAM STARTING IN %s MODE ===\n", modeStr)
+	fmt.Printf("Version: %s\n", buildLabel())
 	fmt.Printf("Archive mode: %s\n", config.ArchiveMode)
 	fmt.Printf("Archive format: %s\n", archiveTypeDesc)
 
@@ -477,8 +544,9 @@ func NewAstroCam(testMode bool) (*AstroCam, error) {
 	ac.fitsExtPattern = fitsExtensionPattern
 	ac.stamps = make(map[string]fileStamp)
 	ac.rejects = make(map[string]int)
-	ac.noVisit = make(map[string]int)
+	ac.firstRefusal = make(map[string]time.Time)
 	ac.conditions = make(map[string]*problemCondition)
+	ac.label = buildLabel()
 
 	// Compile one matcher per area once here, rather than rebuilding them on
 	// every directory scan. QuoteMeta keeps an area name that happens to
@@ -579,25 +647,54 @@ func (ac *AstroCam) areaForFile(name string) string {
 	return ""
 }
 
-// collectCandidates reads one directory once and returns the files that may be
-// packed, grouped by area. A file is a candidate only when it matches an area,
-// looks like a finished FITS file, has not changed since the previous cycle,
-// and is not already sitting in the processed directory. Every one of those is
-// a statement about the file itself, so a file that qualifies stays qualified
+// pendingFrame is an image of a known field that cannot be packed yet: the
+// camera software may still be writing it, or it is not a complete FITS file.
+type pendingFrame struct {
+	area  string
+	name  string
+	mtime time.Time
+}
+
+// strayFile is a FITS file whose name matches no field in areas.txt.
+type strayFile struct {
+	name  string
+	mtime time.Time
+}
+
+// dirScan is what one pass over one image directory found.
+type dirScan struct {
+	ready   map[string][]candidate // finished frames that may be packed, by field
+	pending []pendingFrame         // frames of a known field that are not ready yet
+	strays  []strayFile            // recent FITS files that belong to no field
+}
+
+// scanDir reads one directory once and sorts what it finds.
+//
+// A file is ready to be packed only when it matches an area, looks like a
+// finished FITS file, has not changed since the previous cycle, and is not
+// already sitting in the processed directory. Every one of those is a
+// statement about the file itself, so a file that qualifies stays qualified
 // until it is packed.
+//
+// Files of a known field that do not qualify yet, and recent FITS files that
+// belong to no field at all, are returned as well. Neither is ever packed;
+// they are there so the status lines can say what the camera is producing
+// instead of leaving the operator to guess why nothing is being uploaded.
 //
 // The stamps map is filled in with what every matching file looks like now; it
 // becomes the comparison point for the next cycle.
-func (ac *AstroCam) collectCandidates(dir string, stamps map[string]fileStamp) map[string][]candidate {
+func (ac *AstroCam) scanDir(dir string, stamps map[string]fileStamp) dirScan {
+	found := dirScan{ready: make(map[string][]candidate)}
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			fmt.Printf("Warning: cannot read image directory %s: %v\n", dir, err)
 		}
-		return nil
+		return found
 	}
 
-	byArea := make(map[string][]candidate)
+	notBefore := time.Now().Add(-recentFileWindow)
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -605,6 +702,11 @@ func (ac *AstroCam) collectCandidates(dir string, stamps map[string]fileStamp) m
 		name := entry.Name()
 		area := ac.areaForFile(name)
 		if area == "" {
+			if fitsNamePattern.MatchString(name) {
+				if info, err := entry.Info(); err == nil && info.ModTime().After(notBefore) {
+					found.strays = append(found.strays, strayFile{name: name, mtime: info.ModTime()})
+				}
+			}
 			continue
 		}
 
@@ -620,6 +722,7 @@ func (ac *AstroCam) collectCandidates(dir string, stamps map[string]fileStamp) m
 		// still writing fails this test and waits one more cycle.
 		before, seen := ac.stamps[path]
 		if !seen || before.size != now.size || !before.mtime.Equal(now.mtime) {
+			found.pending = append(found.pending, pendingFrame{area: area, name: name, mtime: now.mtime})
 			continue
 		}
 		obs, hasObs, complete := isCompleteFITS(path, now.size)
@@ -630,6 +733,7 @@ func (ac *AstroCam) collectCandidates(dir string, stamps map[string]fileStamp) m
 			}
 			now.reported = true
 			stamps[path] = now
+			found.pending = append(found.pending, pendingFrame{area: area, name: name, mtime: now.mtime})
 			continue
 		}
 		// Already delivered under this name; never pack it a second time.
@@ -638,7 +742,7 @@ func (ac *AstroCam) collectCandidates(dir string, stamps map[string]fileStamp) m
 		}
 
 		named, hasNamed := parseFrameTime(name)
-		byArea[area] = append(byArea[area], candidate{
+		found.ready[area] = append(found.ready[area], candidate{
 			path:     path,
 			name:     name,
 			obs:      obs,
@@ -649,7 +753,7 @@ func (ac *AstroCam) collectCandidates(dir string, stamps map[string]fileStamp) m
 			mtime:    now.mtime,
 		})
 	}
-	return byArea
+	return found
 }
 
 // sortByArchiveName matches Python _sortByArchiveName method
@@ -718,10 +822,80 @@ func (ac *AstroCam) getArchiveFiles() ([]string, error) {
 		if ri, rj := ac.rejects[files[i]], ac.rejects[files[j]]; ri != rj {
 			return ri < rj
 		}
-		return ac.sortByArchiveName(files[i]) < ac.sortByArchiveName(files[j])
+		if ki, kj := ac.sortByArchiveName(files[i]), ac.sortByArchiveName(files[j]); ki != kj {
+			return ki < kj
+		}
+		// Archives packed in the same second sort by name, so the queue is
+		// listed in the same order on every cycle.
+		return files[i] < files[j]
 	})
 
 	return files, nil
+}
+
+// refreshQueue lists the archives waiting in the temp directory and records
+// how many there are and how big, for the status lines and the banner.
+//
+// It also forgets the refusals of archives that are no longer there. An
+// operator who moves a refused archive away has dealt with it, and the warning
+// about it must not outlive the archive.
+func (ac *AstroCam) refreshQueue() ([]string, error) {
+	archives, err := ac.getArchiveFiles()
+	if err != nil {
+		ac.queueSummary, ac.queuedCount, ac.queuedBytes = "", 0, 0
+		return nil, err
+	}
+
+	var total int64
+	oldest := ""
+	queued := make(map[string]bool, len(archives))
+	for _, a := range archives {
+		queued[a] = true
+		if info, err := os.Stat(a); err == nil {
+			total += info.Size()
+		}
+		if oldest == "" || ac.sortByArchiveName(a) < ac.sortByArchiveName(oldest) {
+			oldest = a
+		}
+	}
+	ac.queuedCount, ac.queuedBytes = len(archives), total
+	if len(archives) == 0 {
+		ac.queueSummary = ""
+	} else {
+		ac.queueSummary = fmt.Sprintf("%s waiting to be delivered (%s), oldest is %s",
+			plural(len(archives), "archive", "archives"), humanBytes(total), filepath.Base(oldest))
+	}
+
+	for a := range ac.rejects {
+		if !queued[a] {
+			delete(ac.rejects, a)
+			delete(ac.firstRefusal, a)
+		}
+	}
+	if ac.hasCondition(conditionArchive) && !ac.anyArchiveRefusedOften() {
+		ac.clearCondition(conditionArchive, "no refused archive is waiting any more")
+	}
+	return archives, nil
+}
+
+// anyArchiveRefusedOften reports whether the server has turned some waiting
+// archive away often enough for it to count as a standing problem.
+func (ac *AstroCam) anyArchiveRefusedOften() bool {
+	for _, n := range ac.rejects {
+		if n >= rejectsBeforeWarning {
+			return true
+		}
+	}
+	return false
+}
+
+// plural renders a count with the right form of its noun: "1 archive",
+// "3 archives".
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
 }
 
 // moveImages moves the frames of a packed archive into the processed
@@ -920,66 +1094,183 @@ func (ac *AstroCam) testArchive(archiveFileName string) error {
 	return ac.testZipArchive(archiveFileName)
 }
 
-// waitForUploadThrottle ensures 120 seconds between upload attempts
-func (ac *AstroCam) waitForUploadThrottle() {
-	const uploadThrottleDelay = 120 * time.Second
-
-	if ac.lastUploadTime.IsZero() {
-		// First upload, no need to wait
-		return
+// context returns the context that is cancelled when the operator asks the
+// program to stop. An AstroCam built by hand in a test has none, and is never
+// stopped.
+func (ac *AstroCam) context() context.Context {
+	if ac.ctx == nil {
+		return context.Background()
 	}
+	return ac.ctx
+}
 
-	timeSinceLastUpload := time.Since(ac.lastUploadTime)
-	if timeSinceLastUpload < uploadThrottleDelay {
-		waitTime := uploadThrottleDelay - timeSinceLastUpload
-		fmt.Printf("Upload throttling: Waiting %v before next upload attempt...\n", waitTime.Round(time.Second))
-		time.Sleep(waitTime)
+// stopping reports whether the operator has asked the program to stop.
+func (ac *AstroCam) stopping() bool {
+	return ac.context().Err() != nil
+}
+
+// sleep waits for d, or until the operator asks the program to stop, whichever
+// comes first. It reports whether the whole wait was served.
+//
+// Every wait of more than a moment goes through here. A plain time.Sleep is
+// deaf to Ctrl+C, and the program used to sit out a two minute pause between
+// uploads before it noticed that it had been told to stop.
+func (ac *AstroCam) sleep(d time.Duration) bool {
+	if d <= 0 {
+		return !ac.stopping()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ac.context().Done():
+		return false
 	}
 }
 
+// cycleInterval is the time between two scans of the camera directories.
+func (ac *AstroCam) cycleInterval() time.Duration {
+	interval := ac.config.Interval
+	if interval < MIN_INTERVAL {
+		interval = MIN_INTERVAL
+	}
+	return time.Duration(interval) * time.Second
+}
+
+// nextUploadAt returns the earliest moment after now at which the next upload
+// may start: uploads are spaced uploadThrottleDelay apart, counted from the
+// start of the previous one. The zero time means "right now".
+func (ac *AstroCam) nextUploadAt(now time.Time) time.Time {
+	if ac.lastUploadTime.IsZero() {
+		return time.Time{}
+	}
+	next := ac.lastUploadTime.Add(uploadThrottleDelay)
+	if !next.After(now) {
+		return time.Time{}
+	}
+	return next
+}
+
+// waitForUploadSlot reports whether an upload may start now.
+//
+// While the next upload is still some way off it returns false at once, and
+// the upload is taken up again on a later cycle. The program used to sleep
+// through that gap instead, and for up to two minutes it neither looked for new
+// images nor printed anything, which is no way to treat images that are waiting
+// to be packed. Only a last stretch of less than half a scan interval is waited
+// out here: short enough that this cycle is over before the next one is due,
+// and long enough that an upload is never put off by a whole cycle for the
+// sake of a few seconds.
+//
+// With stay set the whole gap is waited out here whatever its length. That is
+// for the one case where coming back later would lose the thread: an archive
+// about to be sent again to the fallback server.
+func (ac *AstroCam) waitForUploadSlot(stay bool) bool {
+	next := ac.nextUploadAt(time.Now())
+	if next.IsZero() {
+		return !ac.stopping()
+	}
+	wait := time.Until(next)
+	if wait > ac.cycleInterval()/2 {
+		if !stay {
+			return false
+		}
+		fmt.Printf("Next upload at %s (uploads are spaced %s apart).\n",
+			next.Format("15:04:05"), formatPauseDuration(uploadThrottleDelay))
+	}
+	return ac.sleep(wait)
+}
+
+// neverRedirect stops the HTTP client from following a redirect.
+//
+// A redirect must never be followed with an upload. Go repeats a redirected
+// POST as a GET with no body; the server's status check then answers that GET
+// with UNMW_STATUS:OK, and the archive would be deleted here as delivered
+// although the server never saw it. A redirect is reported as what it is
+// instead: SAI_SERVER points at the wrong address.
+func neverRedirect(req *http.Request, via []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
+// serverAnswer is what a server said when it was asked for its status.
+type serverAnswer struct {
+	// status is one of: "ok", "warning", "error" (the upload script itself
+	// says it cannot take uploads), "http" (the web server in front of it
+	// answered with an error that says the same), "unreachable" (no answer at
+	// all - the only case that fails over to the fallback server), "unknown"
+	// (an answer that says nothing either way) or "stopped" (the operator is
+	// stopping the program, so there is no answer to act on).
+	status   string
+	message  string // the server's own words, or the network error
+	code     int    // HTTP status; 0 when no answer arrived
+	location string // where a redirect points
+}
+
 // checkServerDiskSpace sends a GET preflight request to the given server to
-// check its disk space and load. Returns a status and a message string. Status
-// is one of: "ok", "warning", "error" (server alive but rejecting),
-// "unreachable" (network-level failure - candidate for fail-over) or "unknown"
-// (server answered without a recognized UNMW_STATUS marker).
-func (ac *AstroCam) checkServerDiskSpace(server string) (string, string) {
-	req, err := http.NewRequest("GET", server, nil)
+// check its disk space and load, and reports what came back.
+func (ac *AstroCam) checkServerDiskSpace(server string) serverAnswer {
+	req, err := http.NewRequestWithContext(ac.context(), "GET", server, nil)
 	if err != nil {
-		return "unknown", fmt.Sprintf("failed to create request: %v", err)
+		// Not an address at all. No request can be sent to it, which for every
+		// practical purpose is a server that cannot be reached - and it is
+		// reported that way, with SAI_SERVER named as a thing to check, rather
+		// than passed on to fail again as an upload.
+		return serverAnswer{status: "unreachable", message: fmt.Sprintf("not a usable address: %v", err)}
 	}
 
 	if ac.hasCredentials() {
 		req.SetBasicAuth(ac.config.Username, ac.config.Password)
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 30 * time.Second, CheckRedirect: neverRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
+		if ac.stopping() {
+			return serverAnswer{status: "stopped"}
+		}
 		// Transport-level failure -> the server is unreachable (as opposed to a
 		// server that answers with an error). This is what triggers fail-over.
-		return "unreachable", fmt.Sprintf("preflight request to %s failed: %v", server, err)
+		// Only the network error itself is kept: the address it is wrapped in
+		// is printed by the caller anyway.
+		var wrapped *url.Error
+		if errors.As(err, &wrapped) {
+			err = wrapped.Err
+		}
+		return serverAnswer{status: "unreachable", message: err.Error()}
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	body := string(bodyBytes)
-
-	if strings.Contains(body, "UNMW_STATUS:ERROR") {
-		return "error", body
-	}
-	if strings.Contains(body, "UNMW_STATUS:WARNING") {
-		return "warning", body
-	}
-	if strings.Contains(body, "UNMW_STATUS:OK") {
-		return "ok", ""
+	answer := serverAnswer{
+		status:   "unknown",
+		message:  body,
+		code:     resp.StatusCode,
+		location: resp.Header.Get("Location"),
 	}
 
-	// No UNMW_STATUS marker: old server or unexpected response
-	if resp.StatusCode == 507 {
-		return "error", fmt.Sprintf("server is out of disk space (HTTP 507): %s", body)
+	switch {
+	case strings.Contains(body, "UNMW_STATUS:ERROR"):
+		answer.status = "error"
+	case strings.Contains(body, "UNMW_STATUS:WARNING"):
+		answer.status = "warning"
+	case strings.Contains(body, "UNMW_STATUS:OK"):
+		answer.status = "ok"
+	case resp.StatusCode == 507:
+		// No UNMW_STATUS marker, but the status code alone says it.
+		answer.status = "error"
+		answer.message = fmt.Sprintf("server is out of disk space (HTTP 507): %s", body)
+	default:
+		// No UNMW_STATUS marker: the upload script did not write this answer.
+		// When the status code says the request never reached it, there is no
+		// point in sending an archive after it. Anything else may be an old
+		// server that knows nothing of status checks, so the upload is tried.
+		if _, scope := classifyHTTPStatus(resp.StatusCode); scope != scopeUnclear {
+			answer.status = "http"
+		}
 	}
-
-	return "unknown", ""
+	return answer
 }
 
 // archivePaths returns where to build an archive and where to move it once it
@@ -1369,11 +1660,23 @@ func reportUploadProgress(prog *uploadProgress, server string) func() {
 	}
 }
 
-// uploadFile matches FileUploader functionality with proper resource management
-func (ac *AstroCam) uploadFile(filePath, server string) error {
-	// Wait for upload throttling (120 seconds between uploads)
-	ac.waitForUploadThrottle()
+// httpStatusError is an upload that the server answered with an HTTP status
+// other than success. It keeps the status code apart from the text, so the
+// cause can be told from the code rather than guessed from the wording.
+type httpStatusError struct {
+	code     int    // 401
+	status   string // "401 Unauthorized"
+	body     string // what the server sent along
+	location string // where a redirect points
+}
 
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("server returned status %d: %s; %s", e.code, e.status, e.body)
+}
+
+// uploadFile matches FileUploader functionality with proper resource management.
+// The caller is responsible for the pause between uploads (waitForUploadSlot).
+func (ac *AstroCam) uploadFile(filePath, server string) error {
 	fmt.Printf("Uploading %s to server: %s\n", filepath.Base(filePath), server)
 
 	// Update last upload time before attempting upload
@@ -1382,7 +1685,7 @@ func (ac *AstroCam) uploadFile(filePath, server string) error {
 	// Open file with proper resource management
 	file, err := os.Open(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to open file: %w", err)
+		return fmt.Errorf("%w: %v", errLocalFailure, err)
 	}
 	defer file.Close()
 
@@ -1398,7 +1701,7 @@ func (ac *AstroCam) uploadFile(filePath, server string) error {
 
 	_, err = io.Copy(part, file)
 	if err != nil {
-		return fmt.Errorf("failed to copy file data: %w", err)
+		return fmt.Errorf("%w: %v", errLocalFailure, err)
 	}
 
 	writer.Close()
@@ -1410,8 +1713,10 @@ func (ac *AstroCam) uploadFile(filePath, server string) error {
 	prog := &uploadProgress{total: int64(body.Len())}
 	reader := &progressReader{inner: bytes.NewReader(body.Bytes()), prog: prog}
 
-	// Create HTTP request
-	req, err := http.NewRequest("POST", server, reader)
+	// Create HTTP request. It carries the context that is cancelled when the
+	// operator stops the program, so Ctrl+C ends a transfer that is under way
+	// instead of waiting up to uploadTimeout for it.
+	req, err := http.NewRequestWithContext(ac.context(), "POST", server, reader)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -1432,12 +1737,18 @@ func (ac *AstroCam) uploadFile(filePath, server string) error {
 
 	// Send request. The timeout covers the whole exchange: connecting, handing
 	// over the archive, the server's processing and the reply.
-	client := &http.Client{Timeout: uploadTimeout}
+	client := &http.Client{Timeout: uploadTimeout, CheckRedirect: neverRedirect}
 	started := time.Now()
 	stopProgress := reportUploadProgress(prog, server)
 	resp, err := client.Do(req)
 	stopProgress()
 	if err != nil {
+		// The operator stopped the program in mid-transfer. The archive stays
+		// where it is and goes out on the next start; this is not a failure.
+		if ac.stopping() {
+			return errStopping
+		}
+
 		sent := atomic.LoadInt64(&prog.sent)
 		elapsed := time.Since(started)
 
@@ -1502,8 +1813,15 @@ func (ac *AstroCam) uploadFile(filePath, server string) error {
 	}
 
 	// Include the response body so the caller can classify the cause (e.g. a
-	// 503 "system load too high" -> short pause) from the server's message.
-	uploadErr := fmt.Errorf("server returned status %d: %s; %s", resp.StatusCode, resp.Status, strings.TrimSpace(bodyStr))
+	// 503 "system load too high" -> short pause) from the server's message,
+	// and the status code so a refused login or a wrong address is not taken
+	// for a fault in the archive.
+	uploadErr := &httpStatusError{
+		code:     resp.StatusCode,
+		status:   resp.Status,
+		body:     strings.TrimSpace(bodyStr),
+		location: resp.Header.Get("Location"),
+	}
 	if ac.testMode {
 		fmt.Printf("FATAL ERROR (Test Mode): %v\n", uploadErr)
 		os.Exit(1)
@@ -1571,10 +1889,10 @@ const rejectsBeforeWarning = 3
 
 // A long banner every 15 seconds would bury everything else, and a message
 // printed only once is invisible to an operator who walks up an hour later. So
-// the full banner is repeated every conditionFullBannerEveryCycles cycles and a
-// one-line reminder is printed on every cycle in between, always as the last
-// thing in the cycle - whatever the terminal is showing, the bottom of the
-// screen names the problem.
+// the full banner is repeated every conditionFullBannerEveryCycles cycles, and
+// on every cycle the status lines that end it name each problem in one line -
+// whatever the terminal is showing, the bottom of the screen says what is
+// wrong.
 const conditionFullBannerEveryCycles = 20
 
 // setCondition records, or refreshes, a standing problem. Re-setting the same
@@ -1610,8 +1928,10 @@ func (ac *AstroCam) clearCondition(kind, resolution string) {
 		return
 	}
 	delete(ac.conditions, kind)
-	fmt.Printf("\n=== RESOLVED: %s - %s (the problem lasted %s).\n\n",
-		cond.reason, resolution, formatElapsedDuration(time.Since(cond.since)))
+	fmt.Println()
+	printWrapped("=== ", fmt.Sprintf("RESOLVED: %s - %s (the problem lasted %s).",
+		cond.reason, resolution, formatElapsedDuration(time.Since(cond.since))))
+	fmt.Println()
 }
 
 // hasCondition reports whether a standing problem of this kind is in force.
@@ -1619,11 +1939,23 @@ func (ac *AstroCam) hasCondition(kind string) bool {
 	return ac.conditions[kind] != nil
 }
 
-// reportConditions is called at the end of every cycle and is the whole point
-// of the condition bookkeeping: as long as something is wrong, the last lines
-// on the terminal say what it is, how long it has been wrong, and what
-// astrocam-go is doing about it.
-func (ac *AstroCam) reportConditions() {
+// reportStatus ends every cycle, and it is the one place an operator has to
+// look: the last lines on the terminal always say whether the server is taking
+// uploads, how many archives have gone out and when the last one did, what is
+// still waiting, and when the camera last produced an image.
+//
+// Before this existed a healthy cycle printed two lines that said nothing, and
+// a troubled one could bury its one important message under the chatter of
+// fifty fields. A window that shows only what happened in the last few seconds
+// cannot answer "is it working?" - these lines can, and because they are
+// printed again on every cycle they cannot scroll out of sight.
+//
+// Standing problems are part of it. The full banner of each is printed when it
+// starts and then every conditionFullBannerEveryCycles cycles; a problem with
+// the server takes the place of the "Server OK" sentence, and any other one
+// gets a line of its own below the status lines.
+func (ac *AstroCam) reportStatus() {
+	var others []*problemCondition
 	// Fixed order, so the same problem always appears in the same place.
 	for _, kind := range []string{conditionDelivery, conditionInput, conditionArchive} {
 		cond := ac.conditions[kind]
@@ -1633,10 +1965,181 @@ func (ac *AstroCam) reportConditions() {
 		cond.cycles++
 		if cond.cycles == 1 || cond.cycles%conditionFullBannerEveryCycles == 0 {
 			ac.printConditionBanner(cond)
-		} else {
-			ac.printConditionReminder(cond)
+		}
+		if kind != conditionDelivery {
+			others = append(others, cond)
 		}
 	}
+
+	for _, line := range ac.statusLines(time.Now()) {
+		fmt.Println(line)
+	}
+	for _, cond := range others {
+		ac.printConditionReminder(cond)
+	}
+}
+
+// statusLines builds the status report for one cycle. Every line fits an 80
+// column console, and nothing here asks the terminal how wide it is or moves
+// the cursor: the report is plain text that is simply printed again each time.
+//
+// The first line is about the far end (the server, and what has reached it),
+// the second about this end (what is waiting here, and what the camera is
+// doing). The second starts with the version of this program, so that a
+// photograph of the screen always shows which release produced it.
+func (ac *AstroCam) statusLines(now time.Time) []string {
+	var far []string
+	if cond := ac.conditions[conditionDelivery]; cond != nil {
+		far = append(far, fmt.Sprintf("!!! %s for %s.",
+			strings.ToUpper(cond.reason), formatElapsedDuration(now.Sub(cond.since))))
+		if !cond.until.IsZero() {
+			far = append(far, fmt.Sprintf("Next try at %s.", cond.until.Format("15:04:05")))
+		}
+	} else if ac.serverOKAt.IsZero() && ac.serverAskedAt.IsZero() {
+		// The server is only ever contacted when there is an archive to hand
+		// over, so until then there is honestly nothing to say about it.
+		far = append(far, "Server not contacted yet: no archive has been ready to upload.")
+	} else if ac.serverOKAt.IsZero() {
+		// An old server knows nothing of status checks. It answered, but only
+		// an upload that goes through will show that it is taking them.
+		far = append(far, fmt.Sprintf("Server answered at %s but gave no status.",
+			clockTime(ac.serverAskedAt, now)))
+	} else {
+		name := ac.serverOKName
+		if name == "" {
+			name = "Server"
+		}
+		sentence := fmt.Sprintf("%s OK at %s", name, clockTime(ac.serverOKAt, now))
+		if ac.serverWarning != "" {
+			sentence += ", but " + ac.serverWarning
+		}
+		far = append(far, sentence+".")
+	}
+	if ac.uploadedCount > 0 {
+		far = append(far, fmt.Sprintf("%s uploaded, last at %s.",
+			plural(ac.uploadedCount, "archive", "archives"), clockTime(ac.lastUploadOK, now)))
+	} else if !ac.serverAskedAt.IsZero() || ac.hasCondition(conditionDelivery) {
+		// Left out while the server has not even been contacted: that sentence
+		// already says that nothing has gone out.
+		far = append(far, "No archives uploaded yet.")
+	}
+	lines := flowLines(now.Format("15:04:05")+" ", statusIndent, far)
+
+	var near []string
+	if ac.queuedCount == 0 {
+		near = append(near, "Queue empty.")
+	} else {
+		sentence := plural(ac.queuedCount, "archive", "archives") + " queued"
+		// A server problem already says when the next attempt is due.
+		if next := ac.nextUploadAt(now); !next.IsZero() && !ac.hasCondition(conditionDelivery) {
+			sentence += ", next upload at " + next.Format("15:04:05")
+		}
+		near = append(near, sentence+".")
+	}
+	if ac.lastImageAt.IsZero() {
+		near = append(near, "No images seen yet.")
+	} else {
+		near = append(near, fmt.Sprintf("Last image at %s.", clockTime(ac.lastImageAt, now)))
+	}
+	if ac.waitingFields > 0 {
+		verb, whose := "waits", "its"
+		if ac.waitingFields > 1 {
+			verb, whose = "wait", "their"
+		}
+		what := "for more images"
+		if ac.config.Count == 2 {
+			what = "for " + whose + " 2nd image"
+		}
+		near = append(near, fmt.Sprintf("%s %s %s.",
+			plural(ac.waitingFields, "field", "fields"), verb, what))
+	}
+	lines = append(lines, flowLines(ac.versionGutter(), statusIndent, near)...)
+
+	if ac.strayCount > 0 {
+		verb := "match"
+		if ac.strayCount == 1 {
+			verb = "matches"
+		}
+		lines = append(lines, fmt.Sprintf("%sNOTE: %s %s no field in areas.txt (ignored).",
+			statusIndent, plural(ac.strayCount, "recent FITS file", "recent FITS files"), verb))
+	}
+	return lines
+}
+
+// versionGutter is what starts the second status line: the version of this
+// program, set in the space under the time of day.
+func (ac *AstroCam) versionGutter() string {
+	switch {
+	case ac.label == "":
+		return statusIndent
+	case len(ac.label) < len(statusIndent):
+		return fmt.Sprintf("%*s ", len(statusIndent)-1, ac.label)
+	}
+	return ac.label + " "
+}
+
+// flowLines sets sentences into lines no longer than consoleWidth. The first
+// line starts with the text given as first and the others with rest. A
+// sentence is moved to the next line whole rather than split, and only one too
+// long for a line of its own is broken between words.
+func flowLines(first, rest string, sentences []string) []string {
+	var lines []string
+	line, empty := first, true // empty: nothing but its opening text so far
+
+	fits := func(text string) bool {
+		if empty {
+			return len(line)+len(text) <= consoleWidth
+		}
+		return len(line)+1+len(text) <= consoleWidth
+	}
+	put := func(text string) {
+		if !empty {
+			line += " "
+		}
+		line += text
+		empty = false
+	}
+	nextLine := func() {
+		lines = append(lines, line)
+		line, empty = rest, true
+	}
+
+	for _, sentence := range sentences {
+		switch {
+		case fits(sentence):
+			put(sentence)
+		case !empty && len(rest)+len(sentence) <= consoleWidth:
+			nextLine()
+			put(sentence)
+		default:
+			for _, word := range strings.Fields(sentence) {
+				if !empty && !fits(word) {
+					nextLine()
+				}
+				put(word)
+			}
+		}
+	}
+	if !empty {
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+// clockTime renders a moment for the status lines: the time of day, with the
+// date in front once the moment is more than half a day away. "Last image at
+// 05:14:40" would otherwise look just as healthy the evening after. The date
+// does not appear at midnight: that is the middle of an observing night, and a
+// time of day is not ambiguous within twelve hours of it.
+func clockTime(t, now time.Time) string {
+	age := now.Sub(t)
+	if age < 0 {
+		age = -age
+	}
+	if age < 12*time.Hour {
+		return t.Local().Format("15:04:05")
+	}
+	return t.Local().Format("Jan 2 15:04")
 }
 
 // conditionBannerWidth is the width the banner text is folded to. Narrow enough
@@ -1686,20 +2189,14 @@ func (ac *AstroCam) printConditionBanner(cond *problemCondition) {
 	fmt.Printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n")
 }
 
-// printConditionReminder prints the single-line version shown on the cycles
-// between full banners. It is kept under 80 characters so that it stays one
-// line in the console window and cannot be mistaken for ordinary chatter.
+// printConditionReminder prints the single-line version of a standing problem
+// that follows the status lines on every cycle. It is kept under 80 characters
+// so that it stays one line in the console window and cannot be mistaken for
+// ordinary chatter. How much is waiting is not repeated here: the status lines
+// right above it say so.
 func (ac *AstroCam) printConditionReminder(cond *problemCondition) {
-	retry := ""
-	if !cond.until.IsZero() {
-		retry = ", retry " + cond.until.Format("15:04:05")
-	}
-	queue := ""
-	if ac.queuedCount > 0 {
-		queue = fmt.Sprintf(", %d waiting", ac.queuedCount)
-	}
-	fmt.Printf("!!! %s %s: %s%s%s\n",
-		cond.severity, formatElapsedDuration(time.Since(cond.since)), cond.reason, queue, retry)
+	fmt.Printf("!!! %s %s: %s\n",
+		cond.severity, formatElapsedDuration(time.Since(cond.since)), cond.reason)
 }
 
 // classifyServerError inspects a server UNMW_STATUS:ERROR body (or an upload
@@ -1726,33 +2223,108 @@ func classifyServerError(body string) (string, time.Duration) {
 	return "Server reported a temporary error", HIGH_LOAD_PAUSE
 }
 
+// What an HTTP error status says about where the fault lies.
+const (
+	scopeUnclear = iota // nothing certain: it may be about this one request
+	scopeConfig         // wrong address or login; every request will get it
+	scopeServer         // the server side is broken; nothing here can fix it
+)
+
+// classifyHTTPStatus says what an HTTP error status means when it comes from
+// the web server in front of the upload script rather than from the script
+// itself, whose own answers always carry an UNMW_STATUS marker.
+//
+// These used to be counted against the archive that happened to be on its way,
+// and after three tries the operator was told that the archive was "most
+// likely damaged" and could be removed by hand - for what was a mistyped
+// password, a wrong address in config.env or a proxy with nothing behind it.
+func classifyHTTPStatus(code int) (reason string, scope int) {
+	switch {
+	case code == 401 || code == 407:
+		return fmt.Sprintf("Server refuses the login (HTTP %d)", code), scopeConfig
+	case code == 403:
+		return "Server refuses access (HTTP 403)", scopeConfig
+	case code == 404 || code == 410:
+		return fmt.Sprintf("Upload address not found on the server (HTTP %d)", code), scopeConfig
+	case code >= 300 && code < 400:
+		return fmt.Sprintf("Server redirects uploads elsewhere (HTTP %d)", code), scopeConfig
+	case code >= 500 && code != 507:
+		return fmt.Sprintf("Server-side error (HTTP %d)", code), scopeServer
+	}
+	return "", scopeUnclear
+}
+
+// httpAnswerText describes an HTTP error answer for the banner: the status
+// line, whatever text the page carried, and where a redirect points. The
+// address comes last, so that nothing runs on after it.
+func httpAnswerText(status, location, body string) string {
+	text := "HTTP " + status + "."
+	if page := plainServerText(body); page != "" {
+		text += " " + page
+	}
+	if location != "" {
+		text += " The server redirects to: " + location
+	}
+	return text
+}
+
+// htmlTag matches one HTML tag.
+var htmlTag = regexp.MustCompile(`<[^>]*>`)
+
+// plainServerText makes a server response fit for the console. An error page
+// arrives as HTML, and its tags bury the one sentence that matters; the text
+// is also cut to a length that still leaves room for the rest of a banner.
+func plainServerText(body string) string {
+	text := html.UnescapeString(htmlTag.ReplaceAllString(body, " "))
+	text = strings.Join(strings.Fields(text), " ")
+	const limit = 600
+	if runes := []rune(text); len(runes) > limit {
+		text = string(runes[:limit]) + " ..."
+	}
+	return text
+}
+
 // operatorAdviceFor turns a machine-side reason into the one thing a human at
 // the telescope can actually do about it. Printing "what to do" next to "what
 // is wrong" is the difference between a message that gets acted on and one that
 // gets ignored.
 func operatorAdviceFor(reason string) string {
+	const kept = "Nothing is lost: the archives are kept and retried. "
 	lower := strings.ToLower(reason)
-	if strings.Contains(lower, "disk space") {
+	switch {
+	case strings.Contains(lower, "disk space"):
 		return "Nothing is lost: images keep being packed here and every archive is " +
 			"retried until the server confirms it. To fix it, free disk space on the " +
-			"upload server - astrocam-go cannot do that from here."
-	}
-	if strings.Contains(lower, "load") {
-		return "Nothing is lost: the archives are kept and retried. The server should " +
-			"recover on its own; no action is needed unless this lasts for hours."
-	}
-	if strings.Contains(lower, "unreachable") {
-		return "Nothing is lost: the archives are kept and retried. Check the network " +
-			"connection and that the upload server is up."
+			"upload server - astrocam-go cannot do that from here. Once there is room " +
+			"it carries on by itself at the next retry; restarting it retries at once."
+	case strings.Contains(lower, "system load"):
+		return kept + "The server should recover on its own; no action is needed " +
+			"unless this lasts for hours."
+	case strings.Contains(lower, "unreachable"):
+		return kept + "Check the network connection, that the upload server is up, " +
+			"and that SAI_SERVER in config.env is its address."
+	case strings.Contains(lower, "refuses the login"), strings.Contains(lower, "refuses access"):
+		return kept + "The server does not accept the user name and password it is " +
+			"given: check SAI_USERNAME and SAI_PASSWORD in config.env, then restart astrocam-go."
+	case strings.Contains(lower, "address not found"):
+		return kept + "The server has no upload script at the address it is asked " +
+			"for: check SAI_SERVER in config.env, then restart astrocam-go."
+	case strings.Contains(lower, "redirects"):
+		return kept + "An archive cannot follow a redirect. Set SAI_SERVER in config.env " +
+			"to the address the server redirects to, then restart astrocam-go."
+	case strings.Contains(lower, "server-side error"):
+		return kept + "The fault is on the server or on a proxy in front of it, and " +
+			"has to be fixed there; nothing needs changing on this computer."
 	}
 	return "Nothing is lost: the archives are kept and retried until the server accepts them."
 }
 
 // pauseUploads records that uploads must be skipped until a future time and
 // raises a standing condition so the pause stays on screen for as long as it
-// lasts, instead of scrolling away after one line.
+// lasts, instead of scrolling away after one line. fromStatusCheck says whether
+// the server's status check found the problem, or the answer to an upload did.
 // In test mode, a server-side rejection is fatal (exit immediately).
-func (ac *AstroCam) pauseUploads(reason string, duration time.Duration, detail string) {
+func (ac *AstroCam) pauseUploads(reason string, duration time.Duration, detail string, fromStatusCheck bool) {
 	if ac.testMode {
 		fmt.Printf("FATAL ERROR (Test Mode): %s\n", reason)
 		os.Exit(1)
@@ -1764,10 +2336,11 @@ func (ac *AstroCam) pauseUploads(reason string, duration time.Duration, detail s
 	fmt.Printf("%s. Pausing uploads for %s, will retry after %s.\n",
 		reason, formatPauseDuration(duration), ac.uploadPauseUntil.Format("15:04:05"))
 	ac.setCondition(conditionDelivery, "ERROR", reason,
-		"Server response: "+strings.TrimSpace(detail),
+		"Server response: "+plainServerText(detail),
 		fmt.Sprintf("waiting %s before trying again, and packing new images in the meantime. %s",
 			formatPauseDuration(duration), operatorAdviceFor(reason)),
 		ac.uploadPauseUntil)
+	ac.conditions[conditionDelivery].fromStatusCheck = fromStatusCheck
 }
 
 // isUploadPaused returns true if we are still within a pause window set after a
@@ -1819,43 +2392,110 @@ func uploadErrorIsServerRejection(err error) bool {
 		strings.Contains(lowerErr, "load too high")
 }
 
-// pickServer runs the preflight check once per cycle and returns the server to
-// upload to. A server that cannot be reached is skipped so the fallback is
-// tried; a server that answers with a rejection pauses uploads instead, since
-// failing over would only move the same problem to the other machine.
+// pickServer runs the status check (the preflight) before an upload and
+// returns the server to upload to. A server that cannot be reached is skipped
+// so the fallback is tried; a server that answers with a rejection pauses
+// uploads instead, since failing over would only move the same problem to the
+// other machine.
 func (ac *AstroCam) pickServer(servers []string, from int) (string, int, bool) {
+	const unreachable = "Upload server is unreachable"
+
+	// While a server stays unreachable, the same network error comes back on
+	// every cycle. It is printed when it is new; after that the status lines
+	// name the problem each cycle and the banner repeats the details, which is
+	// enough - the same error text every fifteen seconds only pushes
+	// everything else off the screen.
+	known := ""
+	if cond := ac.conditions[conditionDelivery]; cond != nil && cond.reason == unreachable {
+		known = cond.detail
+	}
+	var failures []string
+	printed := true // whether the failure of the previous server was printed
+
 	for idx := from; idx < len(servers); idx++ {
 		server := servers[idx]
-		if idx > 0 {
+		if idx > 0 && printed {
 			fmt.Printf("Primary server unreachable - trying fallback server: %s\n", server)
 		}
 
-		status, msg := ac.checkServerDiskSpace(server)
-		switch status {
+		answer := ac.checkServerDiskSpace(server)
+		if answer.code != 0 {
+			ac.serverAskedAt = time.Now()
+		}
+		switch answer.status {
+		case "stopped":
+			return "", 0, false
 		case "unreachable":
-			fmt.Printf("Server %s is unreachable: %s\n", server, msg)
+			failure := fmt.Sprintf("%s (%s)", server, answer.message)
+			failures = append(failures, failure)
+			if printed = !strings.Contains(known, failure); printed {
+				fmt.Printf("Server %s is unreachable: %s\n", server, answer.message)
+			}
 			continue
 		case "error":
-			reason, pause := classifyServerError(msg)
-			ac.pauseUploads(reason, pause, msg)
+			reason, pause := classifyServerError(answer.message)
+			ac.pauseUploads(reason, pause, answer.message, true)
+			return "", 0, false
+		case "http":
+			// The web server answered for the upload script, and what it said
+			// holds for an upload as much as for this question. Sending the
+			// archive after it would only collect the same answer the slow way.
+			reason, _ := classifyHTTPStatus(answer.code)
+			status := fmt.Sprintf("%d %s", answer.code, http.StatusText(answer.code))
+			ac.pauseUploads(reason, HIGH_LOAD_PAUSE,
+				httpAnswerText(status, answer.location, answer.message), true)
 			return "", 0, false
 		case "warning":
-			fmt.Printf("Server disk space warning: %s\n", msg)
+			fmt.Printf("Server disk space warning: %s\n", strings.TrimSpace(answer.message))
+			ac.serverAnswersOK(idx, classifyServerWarning(answer.message))
+		case "ok":
+			ac.serverAnswersOK(idx, "")
 		}
 		return server, idx, true
 	}
 
-	fmt.Printf("All upload servers are unreachable - keeping every archive for a later retry\n")
+	detail := "Tried: " + strings.Join(failures, "; ")
+	if detail != known {
+		fmt.Printf("All upload servers are unreachable - keeping every archive for a later retry\n")
+	}
 	if ac.testMode {
 		fmt.Printf("FATAL ERROR (Test Mode): all upload servers are unreachable\n")
 		os.Exit(1)
 	}
-	ac.setCondition(conditionDelivery, "ERROR", "Upload server is unreachable",
-		"Tried: "+strings.Join(servers, ", "),
+	ac.setCondition(conditionDelivery, "ERROR", unreachable, detail,
 		"retrying every cycle, and packing new images in the meantime. "+
 			operatorAdviceFor("unreachable"),
 		time.Time{})
+	ac.conditions[conditionDelivery].fromStatusCheck = true
 	return "", 0, false
+}
+
+// classifyServerWarning puts the server's warning into the few words that fit
+// the status line. The server's full text is printed when it arrives.
+func classifyServerWarning(body string) string {
+	if strings.Contains(strings.ToLower(body), "disk space") {
+		return "it is LOW ON DISK SPACE"
+	}
+	return "it reports a WARNING"
+}
+
+// serverAnswersOK records that the server at position idx in the candidate
+// list has just said it is taking uploads, with or without a warning.
+//
+// A standing problem that the status check itself had found is over at this
+// point, and is withdrawn here rather than left on screen until an archive has
+// gone through: the status line must not go on saying "out of disk space"
+// after the server has said that it has room.
+func (ac *AstroCam) serverAnswersOK(idx int, warning string) {
+	ac.serverOKAt = time.Now()
+	ac.serverOKName = ""
+	if idx > 0 {
+		ac.serverOKName = "Fallback server"
+	}
+	ac.serverWarning = warning
+	if cond := ac.conditions[conditionDelivery]; cond != nil && cond.fromStatusCheck {
+		ac.clearCondition(conditionDelivery, "the upload server answers its status check normally again")
+	}
 }
 
 // uploadPhase delivers the archives waiting in the temp directory, oldest
@@ -1866,27 +2506,10 @@ func (ac *AstroCam) pickServer(servers []string, from int) (string, int, bool) {
 // The phase is bounded in time so a long queue cannot stop new images from
 // being packed. Whatever is left over is simply picked up next cycle.
 func (ac *AstroCam) uploadPhase() {
-	archives, err := ac.getArchiveFiles()
+	archives, err := ac.refreshQueue()
 	if err != nil {
 		fmt.Printf("Error scanning archive files: %v\n", err)
-		ac.queueSummary = ""
-		ac.queuedCount = 0
 		return
-	}
-
-	var waiting int64
-	for _, a := range archives {
-		if info, err := os.Stat(a); err == nil {
-			waiting += info.Size()
-		}
-	}
-	ac.queuedCount = len(archives)
-	if len(archives) == 0 {
-		ac.queueSummary = ""
-	} else {
-		ac.queueSummary = fmt.Sprintf("%d archive(s) waiting to be delivered (%d MB), oldest is %s",
-			len(archives), waiting/(1024*1024), filepath.Base(archives[0]))
-		fmt.Printf("%s\n", ac.queueSummary)
 	}
 
 	// The pause is checked before the empty-queue shortcut on purpose. An empty
@@ -1894,8 +2517,8 @@ func (ac *AstroCam) uploadPhase() {
 	// a full server is a queue that has not been emptied - and skipping the
 	// check here used to leave the standing pause completely unreported.
 	if ac.isUploadPaused() {
-		// Nothing is printed here on purpose: the standing banner at the end of
-		// the cycle already says why the pause exists, how long it has lasted
+		// Nothing is printed here on purpose: the status lines at the end of
+		// the cycle already say why the pause exists, how long it has lasted
 		// and when the next attempt is due.
 		return
 	}
@@ -1905,9 +2528,15 @@ func (ac *AstroCam) uploadPhase() {
 		// withdrawn, never left on the screen unchecked.
 		if ac.hasCondition(conditionDelivery) {
 			if _, _, ok := ac.pickServer(ac.uploadServerCandidates(), 0); ok {
-				ac.clearCondition(conditionDelivery, "the upload server is reachable and has room again")
+				ac.clearCondition(conditionDelivery, "the upload server answers normally again")
 			}
 		}
+		return
+	}
+
+	// Uploads are spaced apart. While the next one is not due yet the server is
+	// not asked anything either; the status lines say when it will be.
+	if !ac.waitForUploadSlot(false) {
 		return
 	}
 
@@ -1918,23 +2547,41 @@ func (ac *AstroCam) uploadPhase() {
 	}
 
 	deadline := time.Now().Add(uploadPhaseBudget)
+	changedServer := false
 	for i := 0; i < len(archives); i++ {
 		archiveFile := archives[i]
 		if time.Now().After(deadline) {
-			fmt.Printf("Upload budget for this cycle is used up; %d archive(s) still waiting.\n",
-				len(archives)-i)
+			fmt.Printf("Looking for new images before uploading more; %s still queued.\n",
+				plural(len(archives)-i, "archive", "archives"))
 			return
+		}
+		if i > 0 || changedServer {
+			// After a change of server the same archive is sent again as soon
+			// as the spacing allows, rather than on some later cycle that would
+			// start over with the server that has just failed.
+			if !ac.waitForUploadSlot(changedServer) {
+				return
+			}
+			changedServer = false
 		}
 
 		err := ac.uploadFile(archiveFile, server)
 		if err == nil {
 			delete(ac.rejects, archiveFile)
+			delete(ac.firstRefusal, archiveFile)
+			ac.uploadedCount++
+			ac.lastUploadOK = time.Now()
+			ac.serverAskedAt, ac.serverOKAt = ac.lastUploadOK, ac.lastUploadOK
+			ac.serverOKName = ""
+			if si > 0 {
+				ac.serverOKName = "Fallback server"
+			}
 			// An archive the server has confirmed is the only proof that
 			// delivery really works, so this is where a standing delivery
 			// problem is declared over.
 			ac.clearCondition(conditionDelivery, "an archive was delivered successfully")
-			if len(ac.rejects) == 0 {
-				ac.clearCondition(conditionArchive, "every archive has been accepted")
+			if !ac.anyArchiveRefusedOften() {
+				ac.clearCondition(conditionArchive, "the archive that was being refused has been accepted")
 			}
 			if delErr := ac.deleteFile(archiveFile); delErr != nil {
 				fmt.Printf("Warning: Error deleting file after upload: %v\n", delErr)
@@ -1942,7 +2589,14 @@ func (ac *AstroCam) uploadPhase() {
 			continue
 		}
 
-		fmt.Printf("Upload error (%s): %v\n", server, err)
+		// The operator is stopping the program. The archive is intact and goes
+		// out on the next start; there is nothing to report or to count.
+		if errors.Is(err, errStopping) {
+			return
+		}
+
+		// An error page arrives as HTML; print what it says, not its markup.
+		fmt.Printf("Upload error (%s): %s\n", server, plainServerText(err.Error()))
 
 		// A timeout means the server IS reachable, so do not fail over to the
 		// other server as if it had vanished, and do not let the queue grind
@@ -1965,30 +2619,95 @@ func (ac *AstroCam) uploadPhase() {
 				return
 			}
 			server, si = next, ni
+			changedServer = true
 			i--
 			continue
 		}
 		if uploadErrorIsServerRejection(err) {
 			reason, pause := classifyServerError(err.Error())
-			ac.pauseUploads(reason, pause, err.Error())
+			ac.pauseUploads(reason, pause, err.Error(), false)
 			return
+		}
+
+		// A refused login, a wrong address or a redirect is the same for every
+		// archive, so it is a problem with the server (or with config.env) and
+		// not with the archive that happened to be sent. Sending the others
+		// after it would only collect the same answer once per archive.
+		var answer *httpStatusError
+		if errors.As(err, &answer) {
+			if reason, scope := classifyHTTPStatus(answer.code); scope == scopeConfig {
+				ac.pauseUploads(reason, HIGH_LOAD_PAUSE,
+					httpAnswerText(answer.status, answer.location, answer.body), false)
+				return
+			}
 		}
 
 		// The server refused this particular archive. Keep it and let it fall
 		// behind the others, so one archive cannot hold up the whole queue.
-		ac.rejects[archiveFile]++
-		if ac.rejects[archiveFile] >= rejectsBeforeWarning {
-			// One archive the server keeps refusing is a different illness from
-			// a server that is down, and it will never fix itself: say so
-			// instead of letting it circle the queue forever in silence.
-			ac.setCondition(conditionArchive, "WARNING",
-				"The server keeps refusing an archive",
-				fmt.Sprintf("%s has been refused %d times. Last answer: %v",
-					filepath.Base(archiveFile), ac.rejects[archiveFile], err),
-				"still delivering the other archives and retrying this one last, every cycle. "+
-					"It is most likely damaged; it can be removed from the temp directory by hand.",
-				time.Time{})
-		}
+		ac.noteRefusal(archiveFile, err)
+	}
+}
+
+// noteRefusal records that the server answered an upload without accepting the
+// archive, and turns that into a standing problem once the same archive has
+// been refused rejectsBeforeWarning times.
+//
+// Whose fault it is gets judged from what else has happened, never assumed.
+// The message used to say "most likely damaged; it can be removed from the
+// temp directory by hand" in every case, which is an invitation to delete good
+// data whenever the trouble is really on the server. Only when other archives
+// have been accepted in the meantime does the evidence point at this one.
+func (ac *AstroCam) noteRefusal(archiveFile string, err error) {
+	if ac.firstRefusal == nil {
+		ac.firstRefusal = make(map[string]time.Time)
+	}
+	if _, seen := ac.firstRefusal[archiveFile]; !seen {
+		ac.firstRefusal[archiveFile] = time.Now()
+	}
+	ac.rejects[archiveFile]++
+	times := ac.rejects[archiveFile]
+	if times < rejectsBeforeWarning {
+		return
+	}
+
+	name := filepath.Base(archiveFile)
+	answer := plainServerText(err.Error())
+	switch {
+	case errors.Is(err, errLocalFailure):
+		ac.setCondition(conditionArchive, "WARNING",
+			"An archive cannot be read from this computer's disk",
+			fmt.Sprintf("%s could not be read %d times: %v", name, times, err),
+			"retrying it; nothing is deleted. The server has not been sent this archive, "+
+				"so the fault is on this computer: another program may be holding the file "+
+				"open, or the disk is failing.",
+			time.Time{})
+	case ac.lastUploadOK.After(ac.firstRefusal[archiveFile]):
+		ac.setCondition(conditionArchive, "WARNING",
+			"The server keeps refusing one archive",
+			fmt.Sprintf("%s has been refused %d times, while other archives were accepted. Last answer: %s",
+				name, times, answer),
+			"still delivering the other archives, and retrying this one after them. "+
+				"Other archives go through, so the fault is in this archive or in the images "+
+				"inside it; the server's answer above says what it objects to. The archive "+
+				"stays in the temp directory - move it somewhere else by hand to end the retries.",
+			time.Time{})
+	case len(ac.rejects) > 1:
+		ac.setCondition(conditionArchive, "WARNING",
+			"The server refuses every archive it is sent",
+			fmt.Sprintf("%d archives have been refused and none accepted in the meantime. Last answer (for %s): %s",
+				len(ac.rejects), name, answer),
+			"retrying them in turn; nothing is deleted. When no archive at all is accepted "+
+				"the cause is usually on the server and not in the archives: show the "+
+				"server's answer above to whoever looks after the upload server.",
+			time.Time{})
+	default:
+		ac.setCondition(conditionArchive, "WARNING",
+			"The server keeps refusing an archive",
+			fmt.Sprintf("%s has been refused %d times. Last answer: %s", name, times, answer),
+			"retrying it; nothing is deleted. No other archive has been sent "+
+				"in the meantime, so it is not yet clear whether the fault is in this archive "+
+				"or on the server - the server's answer above is the place to look.",
+			time.Time{})
 	}
 }
 
@@ -1999,6 +2718,12 @@ func (ac *AstroCam) uploadPhase() {
 // directory is safe, because it is retried until it is delivered, so the
 // shortest possible path from the camera directory into the temp directory is
 // what actually protects a night's data.
+//
+// Along the way it notes, for the status lines, what could NOT be packed and
+// why: fields still waiting for the rest of their images, sets that were given
+// up, and image files that belong to no field at all. An image that is not
+// being uploaded always has a reason, and the operator is owed that reason in
+// words rather than a count of files and a shrug.
 func (ac *AstroCam) makeJobForAreas() {
 	dirs := ac.scanDirs()
 
@@ -2013,26 +2738,29 @@ func (ac *AstroCam) makeJobForAreas() {
 			fmt.Sprintf("Looked for: %v", dirs),
 			"looking again every cycle. Nothing can be packed or uploaded until one of "+
 				"these directories exists - check that the camera software is running and "+
-				"writing where CAMERA_DIRECTORY says it does.",
+				"writing where SAI_CAMERA_DIRECTORY in config.env says it does.",
 			time.Time{})
+		// Nothing can be said about folders that are not there.
+		ac.waitingFields, ac.openFields = 0, nil
+		ac.noteStrays(nil)
 		return
 	}
 	ac.clearCondition(conditionInput, "a camera image directory is readable again")
-	if set := fmt.Sprintf("%v", existing); set != ac.lastScanSet {
-		fmt.Printf("Scanning %d image directories: %v\n", len(existing), existing)
-		ac.lastScanSet = set
-	}
+	ac.reportScanSet(existing)
 
 	// Candidates from every scanned folder are pooled before a visit is chosen,
 	// so a visit whose frames straddle a folder boundary is still seen as one
 	// visit. Grouping by frame time rather than by folder is what keeps the
 	// frames of two different visits out of the same archive.
 	stamps := make(map[string]fileStamp)
-	byArea := make(map[string][]candidate)
+	ready := make(map[string][]candidate)
+	unready := make(map[string][]pendingFrame)
 	seenName := make(map[string]bool)
+	var strays []strayFile
 
 	for _, dir := range existing {
-		for area, cands := range ac.collectCandidates(dir, stamps) {
+		found := ac.scanDir(dir, stamps)
+		for area, cands := range found.ready {
 			for _, c := range cands {
 				// The same base name in two folders is one frame as far as an
 				// archive is concerned; keep the first copy found.
@@ -2040,44 +2768,126 @@ func (ac *AstroCam) makeJobForAreas() {
 					continue
 				}
 				seenName[c.name] = true
-				byArea[area] = append(byArea[area], c)
+				ready[area] = append(ready[area], c)
 			}
 		}
+		for _, p := range found.pending {
+			if seenName[p.name] {
+				continue
+			}
+			seenName[p.name] = true
+			unready[p.area] = append(unready[p.area], p)
+		}
+		strays = append(strays, found.strays...)
 	}
 
+	now := time.Now()
+	open := make(map[string]bool)
+	waiting, leftImages, leftFields, explained := 0, 0, 0, 0
 	hasNewFiles := false
+
 	for _, area := range ac.areas {
-		cands := byArea[area]
-		if len(cands) == 0 {
+		// Packing one archive takes a moment; an operator who has asked the
+		// program to stop should not have to sit through all the others.
+		if ac.stopping() {
+			break
+		}
+		cands, pending := ready[area], unready[area]
+		if len(cands) == 0 && len(pending) == 0 {
 			continue
 		}
+		// A field listed twice in areas.txt is still one field.
+		delete(ready, area)
+		delete(unready, area)
 
-		// Settle on one time source for this field before any gap between its
-		// frames is measured.
-		resolveFrameTimes(cands)
-
-		visit := selectVisit(cands, ac.config.Count, visitGap)
-		if visit == nil {
-			// Enough frames are present but they belong to different visits,
-			// so none of them forms a set that may be packed. Say so once per
-			// change rather than on every cycle for the rest of the night.
-			if len(cands) >= ac.config.Count && ac.noVisit[area] != len(cands) {
-				fmt.Printf("INFO: Area '%s' has %d ready frame(s) but no single visit of %d\n",
-					area, len(cands), ac.config.Count)
+		for _, c := range cands {
+			if c.mtime.After(ac.lastImageAt) {
+				ac.lastImageAt = c.mtime
 			}
-			ac.noVisit[area] = len(cands)
-			continue
 		}
-		delete(ac.noVisit, area)
+		for _, p := range pending {
+			if p.mtime.After(ac.lastImageAt) {
+				ac.lastImageAt = p.mtime
+			}
+		}
 
-		hasNewFiles = true
-		archiveFile, err := ac.packVisit(area, visit)
-		if err != nil {
-			fmt.Printf("Error processing area %s: %v\n", area, err)
+		packed := false
+		if len(cands) > 0 {
+			// Settle on one time source for this field before any gap between
+			// its frames is measured.
+			resolveFrameTimes(cands)
+
+			if visit := selectVisit(cands, ac.config.Count, visitGap); visit != nil {
+				hasNewFiles = true
+				archiveFile, err := ac.packVisit(area, visit)
+				if err != nil {
+					fmt.Printf("Error processing area %s: %v\n", area, err)
+				} else {
+					fmt.Printf("Archive created: %s\n", filepath.Base(archiveFile))
+					packed = true
+					cands = framesNotIn(cands, visit)
+				}
+			}
+		}
+
+		// The rest is about what is still lying in the camera folders for this
+		// field, and why it was not packed just now.
+		if len(cands)+len(pending) == 0 {
 			continue
 		}
-		fmt.Printf("Archive created: %s\n", filepath.Base(archiveFile))
+		if selectVisit(cands, ac.config.Count, visitGap) != nil {
+			// Another complete set (or the one that could not be packed a
+			// moment ago) is waiting; it is taken on the next cycle.
+			continue
+		}
+		newest, recent := newestFrames(cands, pending, visitGap)
+		if now.Sub(newest) <= visitGap {
+			// Something arrived for this field within the time a visit may
+			// take, so its set can still be completed.
+			open[area] = true
+			if recent < ac.config.Count {
+				waiting++
+			}
+			continue
+		}
+		if len(cands) == 0 {
+			// Only files that are not finished FITS images; each of those has
+			// been reported once already.
+			continue
+		}
+
+		// No new image for longer than a visit may last: whatever is here will
+		// never become a set. Say so at the moment the wait is given up, when
+		// the operator can still see which field it was about.
+		if ac.openFields[area] && !packed {
+			for _, line := range describeNoSet(area, cands, ac.config.Count, visitGap) {
+				fmt.Println(line)
+			}
+			explained += len(cands)
+		}
+		leftImages += len(cands)
+		leftFields++
 	}
+
+	ac.openFields = open
+	ac.waitingFields = waiting
+
+	// Incomplete sets that were already old when this run first saw them are
+	// summed up once. Listing them field by field would bury the screen in
+	// last month's leftovers every time the program starts. The sum waits for
+	// a cycle that packs nothing: while a backlog of complete sets is still
+	// being worked through, what will be left over is not yet known.
+	if leftImages > 0 && !ac.leftoversTold && !hasNewFiles {
+		ac.leftoversTold = true
+		if leftImages > explained {
+			fmt.Printf("Left in the camera folders: %s of %s that never made a\n",
+				plural(leftImages, "older image", "older images"), plural(leftFields, "field", "fields"))
+			fmt.Printf("  complete set (%d images within %s). They are not uploaded.\n",
+				ac.config.Count, formatPauseDuration(visitGap))
+		}
+	}
+
+	ac.noteStrays(strays)
 
 	// Only the files seen this cycle are remembered, so this table cannot grow
 	// without bound during a run that lasts for weeks.
@@ -2087,6 +2897,77 @@ func (ac *AstroCam) makeJobForAreas() {
 	if ac.testMode && hasNewFiles {
 		ac.testStartTime = time.Now() // Reset timeout when we find files
 	}
+}
+
+// reportScanSet says which folders are being watched, whenever that changes.
+//
+// Every night adds a dated folder and none is ever dropped, so after a few
+// months the full list runs to several screens. The first few are shown and
+// the rest are counted, which is enough to see that the right place is being
+// watched without pushing everything else off the terminal.
+func (ac *AstroCam) reportScanSet(existing []string) {
+	set := strings.Join(existing, "\n")
+	if set == ac.lastScanSet {
+		return
+	}
+	ac.lastScanSet = set
+
+	const shown = 3
+	fmt.Printf("Watching %s for images:\n", plural(len(existing), "folder", "folders"))
+	for i, dir := range existing {
+		if i == shown && len(existing) > shown+1 {
+			fmt.Printf("  ... and %d older ones beside them\n", len(existing)-shown)
+			break
+		}
+		fmt.Printf("  %s\n", dir)
+	}
+}
+
+// noteStrays records how many recent FITS files match no field, for the status
+// lines, and explains them: when they first appear, and again now and then
+// while more keep arriving.
+//
+// Such files are skipped without a word by the scan itself, which is exactly
+// what happens all night long when the camera software names its files in a
+// way this program does not expect - and a night of images that are never
+// uploaded should not look, on screen, the same as a night with no images.
+func (ac *AstroCam) noteStrays(strays []strayFile) {
+	ac.strayCount = len(strays)
+	if len(strays) == 0 {
+		ac.strayTold = 0
+		return
+	}
+	if len(strays) <= ac.strayTold {
+		// Nothing new since the last explanation. Remember the smaller number,
+		// so that the next file to arrive counts as new.
+		ac.strayTold = len(strays)
+		return
+	}
+	if ac.strayTold > 0 && ac.cycle-ac.strayToldCycle < conditionFullBannerEveryCycles {
+		return
+	}
+	ac.strayTold, ac.strayToldCycle = len(strays), ac.cycle
+
+	newest := strays[0]
+	for _, s := range strays[1:] {
+		if s.mtime.After(newest.mtime) {
+			newest = s
+		}
+	}
+	verb, they := "match", "are"
+	if len(strays) == 1 {
+		verb, they = "matches", "is"
+	}
+	period := formatPauseDuration(recentFileWindow)
+	if recentFileWindow == time.Hour {
+		period = "hour" // "in the last hour", not "in the last 1 hour"
+	}
+	fmt.Printf("NOTE: %s written in the last %s %s no field in areas.txt\n",
+		plural(len(strays), "FITS file", "FITS files"), period, verb)
+	fmt.Printf("  and %s ignored. The newest one:\n", they)
+	fmt.Printf("    %s\n", newest.name)
+	fmt.Printf("  A file is taken only when its name starts with a field name from areas.txt\n")
+	fmt.Printf("  followed by \"_\" (in NINA the file pattern must start with $$TARGETNAME$$).\n")
 }
 
 // checkLeftoverArchives tests the archives already waiting in the temp
@@ -2107,6 +2988,11 @@ func (ac *AstroCam) checkLeftoverArchives() {
 	badDir := filepath.Join(ac.tempDirectory, "bad")
 
 	for _, archiveFile := range archives {
+		// Reading a long queue back takes a while; do not hold up an operator
+		// who has changed their mind about starting the program.
+		if ac.stopping() {
+			return
+		}
 		testErr := ac.testArchive(archiveFile)
 		if testErr == nil {
 			continue
@@ -2141,18 +3027,28 @@ func (ac *AstroCam) checkTestTimeout() {
 
 // programLoop matches Python programLoop function
 func (ac *AstroCam) programLoop() {
+	ac.cycle++
+
 	// Pack first. Getting a complete visit into the temp directory is what
 	// makes it safe, and that must not wait behind a queue of retries.
-	fmt.Printf("Scanning camera directories... %s\n", time.Now().Format("2006-01-02 15:04:05"))
 	ac.makeJobForAreas()
 
-	fmt.Printf("Delivering archives... %s\n", time.Now().Format("2006-01-02 15:04:05"))
-	ac.uploadPhase()
+	if !ac.stopping() {
+		ac.uploadPhase()
+	}
+	if ac.stopping() {
+		// The operator is leaving. What is still waiting is summed up once on
+		// the way out, which is more use than a status report cut short.
+		return
+	}
 
 	// Last, so that whatever else this cycle printed, the bottom of the terminal
-	// carries any problem that is still going on. An operator who glances at the
-	// window sees the fault, not the scanning chatter that came after it.
-	ac.reportConditions()
+	// says how things stand and names any problem that is still going on. An
+	// operator who glances at the window sees that, not the chatter before it.
+	// The queue is counted again first, because the uploads above have just
+	// changed it (a failure to read it was reported by uploadPhase already).
+	ac.refreshQueue()
+	ac.reportStatus()
 
 	// Check test timeout
 	ac.checkTestTimeout()
@@ -2184,6 +3080,10 @@ func (ac *AstroCam) run() {
 		fmt.Printf("  Scan interval: %d seconds (minimum: %d)\n", actualInterval, MIN_INTERVAL)
 	}
 
+	fmt.Printf("  Upload server: %s\n", ac.config.Server)
+	if servers := ac.uploadServerCandidates(); len(servers) > 1 {
+		fmt.Printf("  Fallback server: %s\n", servers[1])
+	}
 	fmt.Printf("  Files per archive: %d\n", ac.config.Count)
 	fmt.Printf("  Camera directory: %s\n", ac.config.CameraDirectory)
 	fmt.Printf("  Processed directory: %s\n", ac.config.ProcessedDirectory)
@@ -2208,35 +3108,97 @@ func (ac *AstroCam) run() {
 	}
 	fmt.Println("========================================")
 
-	// Set up signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
+	// A request to stop - Ctrl+C, closing the console window, a termination
+	// signal - cancels this context, and everything that can take a while (an
+	// upload under way, a status check, a wait) is tied to it. The request used
+	// to be looked at only between two cycles, so a cycle that was waiting to
+	// upload ignored Ctrl+C for minutes on end.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ac.ctx = ctx
+
+	sigChan := make(chan os.Signal, 2)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigChan
+		fmt.Printf("\nStop requested (%v). Stopping...\n", sig)
+		cancel()
+		// Whatever is still holding the program up, a second request is not
+		// made to wait for it. Nothing is lost by leaving at once: an archive
+		// is deleted only after the server has confirmed it.
+		sig = <-sigChan
+		fmt.Printf("Stop requested again (%v) - leaving at once.\n", sig)
+		os.Exit(1)
+	}()
 
 	// Use the actual interval (with minimum enforcement)
-	ticker := time.NewTicker(time.Duration(actualInterval) * time.Second)
+	ticker := time.NewTicker(ac.cycleInterval())
 	defer ticker.Stop()
 
 	// Archives left by an earlier run are checked once, before the first
 	// cycle, so a damaged one does not slow down every cycle that follows.
 	ac.checkLeftoverArchives()
 
-	// Run once immediately
+	// Run once immediately, then once per interval until told to stop.
 	ac.programLoop()
-
-	// Main loop
-	for {
+	for !ac.stopping() {
 		select {
 		case <-ticker.C:
 			ac.programLoop()
-		case sig := <-sigChan:
-			fmt.Printf("\nShutdown signal received (%v). Performing cleanup...\n", sig)
-			return
+		case <-ctx.Done():
 		}
+	}
+
+	// Say what is left behind, so that stopping never looks like losing data.
+	_, err := ac.refreshQueue()
+	switch {
+	case err != nil:
+		fmt.Printf("astrocam-go stopped.\n")
+	case ac.queuedCount > 0:
+		fmt.Printf("astrocam-go stopped. %s (%s) not yet uploaded: kept in\n",
+			plural(ac.queuedCount, "archive", "archives"), humanBytes(ac.queuedBytes))
+		fmt.Printf("  %s\n", ac.tempDirectory)
+		fmt.Printf("  and sent the next time astrocam-go runs.\n")
+	default:
+		fmt.Printf("astrocam-go stopped. No archive was waiting to be uploaded.\n")
 	}
 }
 
 // Version is set by build flags during release builds
 var version string
+
+// buildLabel names this binary: the release tag when it was built as a
+// release, otherwise the source revision the Go toolchain recorded. It is
+// printed at startup and in every status report, because a screenshot of the
+// console is how problems get reported, and the first thing to know about a
+// screenshot is which version of the program produced it.
+func buildLabel() string {
+	if version != "" {
+		return version
+	}
+	revision, modified := "", false
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				revision = setting.Value
+			case "vcs.modified":
+				modified = setting.Value == "true"
+			}
+		}
+	}
+	if revision == "" {
+		return "dev"
+	}
+	if len(revision) > 7 {
+		revision = revision[:7]
+	}
+	if modified {
+		// Built from files that differ from that revision.
+		revision += "+"
+	}
+	return "dev-" + revision
+}
 
 func main() {
 	// Disable Windows QuickEdit mode first thing to prevent console freezing
@@ -2255,7 +3217,7 @@ func main() {
 		if version != "" {
 			fmt.Printf("AstroCam-GO %s\n", version)
 		} else {
-			fmt.Println("AstroCam-GO (development build)")
+			fmt.Printf("AstroCam-GO %s (development build)\n", buildLabel())
 		}
 		return
 	}

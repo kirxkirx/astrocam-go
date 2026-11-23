@@ -316,6 +316,122 @@ func selectVisit(cands []candidate, count int, visitGap time.Duration) []candida
 	return nil
 }
 
+// framesNotIn returns the frames that are not part of the given visit.
+func framesNotIn(frames, visit []candidate) []candidate {
+	taken := make(map[string]bool, len(visit))
+	for _, c := range visit {
+		taken[c.path] = true
+	}
+	var rest []candidate
+	for _, c := range frames {
+		if !taken[c.path] {
+			rest = append(rest, c)
+		}
+	}
+	return rest
+}
+
+// newestFrames looks at everything a field still has in the camera folders,
+// ready or not, and returns when the most recent file was written and how many
+// files were written within gap of it.
+//
+// File times are used here, not the frame times that decide what may share an
+// archive, because the question is a different one: not "do these frames
+// belong together" but "is the camera still at work on this field". Nothing is
+// ever packed, or held back, on the strength of this answer; it only decides
+// what the operator is told.
+func newestFrames(ready []candidate, pending []pendingFrame, gap time.Duration) (newest time.Time, recent int) {
+	times := make([]time.Time, 0, len(ready)+len(pending))
+	for _, c := range ready {
+		times = append(times, c.mtime)
+	}
+	for _, p := range pending {
+		times = append(times, p.mtime)
+	}
+	for _, t := range times {
+		if t.After(newest) {
+			newest = t
+		}
+	}
+	for _, t := range times {
+		if newest.Sub(t) <= gap {
+			recent++
+		}
+	}
+	return newest, recent
+}
+
+// describeNoSet explains why the images a field has are not being combined
+// into an archive. It is only called for frames among which selectVisit found
+// no complete visit, and it returns lines that fit an 80 column console.
+//
+// "Has 2 images, needs 2" with nothing uploaded is the most baffling thing
+// this program can show, and the two cases behind it call for different words:
+// either the visit ended before all its images had arrived, or the images are
+// there but were taken too far apart to be one visit. Mixing two visits in one
+// archive is the one thing the server cannot tolerate, so the second case is
+// deliberate - but it has to be said, not left for the operator to work out.
+func describeNoSet(area string, frames []candidate, count int, gap time.Duration) []string {
+	n := len(frames)
+	if n == 0 {
+		return nil
+	}
+	sorted := make([]candidate, n)
+	copy(sorted, frames)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].when.Before(sorted[j].when) })
+
+	// The size of the most recent visit: the frames at the end of the list
+	// with no more than gap between one and the next.
+	last := 1
+	for i := n - 1; i > 0 && sorted[i].when.Sub(sorted[i-1].when) <= gap; i-- {
+		last++
+	}
+	limit := formatPauseDuration(gap)
+
+	var sentences []string
+	switch {
+	case last == n:
+		stay := "the image stays where it is"
+		if n > 1 {
+			stay = "the images stay where they are"
+		}
+		sentences = []string{
+			fmt.Sprintf("only %d of %d images arrived, and %s have passed.", n, count, limit),
+			fmt.Sprintf("The set is NOT complete: nothing is uploaded, %s.", stay),
+		}
+	case n == 2:
+		sentences = []string{
+			fmt.Sprintf("its 2 images were taken %s apart.", roughDuration(sorted[1].when.Sub(sorted[0].when))),
+			fmt.Sprintf("More than %s means two separate visits: they are NOT combined.", limit),
+		}
+	default:
+		sentences = []string{
+			fmt.Sprintf("%d images, but no %d of them within %s of each other.", n, count, limit),
+			"They are from separate visits and are NOT combined.",
+		}
+	}
+	// The name of a field can be any length, so the text is set into lines
+	// here rather than written out with fixed line breaks.
+	return flowLines("Field "+area+": ", "  ", sentences)
+}
+
+// roughDuration renders the time between two images the way it would be said
+// aloud: in minutes below two hours, in hours below two days, in days beyond.
+// It rounds up, so a gap that is too long never reads as exactly the limit.
+func roughDuration(d time.Duration) string {
+	if d < 0 {
+		d = -d
+	}
+	up := func(unit time.Duration) int { return int((d + unit - 1) / unit) }
+	switch {
+	case d < 2*time.Hour:
+		return plural(up(time.Minute), "minute", "minutes")
+	case d < 48*time.Hour:
+		return plural(up(time.Hour), "hour", "hours")
+	}
+	return plural(up(24*time.Hour), "day", "days")
+}
+
 // distinctNames reports whether every candidate has a different base name.
 // Both zip and rar store two members under the same name without complaining,
 // and the server counts members rather than distinct names, so such an archive
